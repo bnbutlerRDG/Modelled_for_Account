@@ -1,0 +1,136 @@
+-- Generate a range of dates from '2023-01-01' to the current date, truncated to the start of each month
+WITH DateRange AS (
+  SELECT
+    DATE_TRUNC(DATE_ADD(DATE('2023-01-01'), INTERVAL month MONTH), MONTH) AS dc_month
+  FROM
+    UNNEST(GENERATE_ARRAY(0, DATE_DIFF(CURRENT_DATE(), DATE('2023-01-01'), MONTH))) AS month
+),
+
+-- Extract contract details for each publisher, including start and end months
+ActiveContracts AS (
+  SELECT
+    `Publisher Organization` AS dc_publisher,
+    DATE_TRUNC(`Contract Start Date`, MONTH) AS dc_start_month,
+    DATE_TRUNC(COALESCE(`Contract Expiry Date`, CURRENT_DATE()), MONTH) AS dc_end_month
+  FROM
+    `rdmga4.RDMreports.daily_consumption`
+),
+
+-- Extract daily active contracts, filtered by metrics collection date and contract dates
+DailyActiveContracts AS (
+  SELECT
+    `Publisher Organization` AS dc_publisher,
+    DATE_TRUNC(`Metrics Collection Date`, MONTH) AS dc_month,
+    `Contract Code` AS dc_contract_code
+  FROM
+    `rdmga4.RDMreports.daily_consumption`
+  WHERE
+    `Metrics Collection Date` IS NOT NULL
+    AND `Contract Start Date` <= `Metrics Collection Date`
+    AND (`Contract Expiry Date` IS NULL OR `Contract Expiry Date` >= `Metrics Collection Date`)
+),
+
+-- Calculate the number of active contracts for each publisher and month
+ActiveContractsMonthly AS (
+  SELECT
+    dc_month,
+    dc_publisher,
+    COUNT(DISTINCT dc_contract_code) AS dc_active_contracts
+  FROM
+    DailyActiveContracts
+  GROUP BY
+    dc_month, dc_publisher
+),
+
+-- Calculate month-over-month increase in active contracts for each publisher
+MoMIncrease AS (
+  SELECT
+    dc_publisher,
+    dc_month,
+    dc_active_contracts,
+    LAG(dc_active_contracts) OVER (PARTITION BY dc_publisher ORDER BY dc_month) AS dc_previous_active_contracts,
+    CASE
+      WHEN LAG(dc_active_contracts) OVER (PARTITION BY dc_publisher ORDER BY dc_month) IS NULL THEN 0
+      ELSE ROUND((dc_active_contracts - LAG(dc_active_contracts) OVER (PARTITION BY dc_publisher ORDER BY dc_month)) / LAG(dc_active_contracts) OVER (PARTITION BY dc_publisher ORDER BY dc_month) * 100, 2)
+    END AS dc_mom_percentage_increase
+  FROM
+    ActiveContractsMonthly
+),
+
+-- Get a list of new data products for each publisher and month
+NewDataProducts AS (
+  SELECT
+    `Organization Name` AS dc_publisher,
+    DATE_TRUNC(`Published Date`, MONTH) AS dc_month,
+    STRING_AGG(DISTINCT `Data Product Name`, ', ') AS dc_new_data_products
+  FROM
+    `rdmga4.RDMreports.data_product_catalogue`
+  GROUP BY
+    dc_publisher, dc_month
+),
+
+-- Get the top 20 data products by the number of active contracts
+Top20Products AS (
+  SELECT
+    `Data Product Name` AS dc_data_product_name,
+    COUNT(DISTINCT `Contract Code`) AS dc_active_contracts
+  FROM
+    `rdmga4.RDMreports.daily_consumption`
+  GROUP BY
+    `Data Product Name`
+  ORDER BY
+    dc_active_contracts DESC
+  LIMIT 20
+),
+
+-- List of top 20 data products
+Top20ProductsList AS (
+  SELECT dc_data_product_name
+  FROM Top20Products
+),
+
+-- Calculate the number of top 20 products for each publisher and month
+Top20ProductsMonthly AS (
+  SELECT
+    dac.dc_month,
+    dac.dc_publisher,
+    COUNT(DISTINCT dp.`Data Product Name`) AS dc_top_20_products_count
+  FROM
+    DailyActiveContracts dac
+  JOIN
+    `rdmga4.RDMreports.daily_consumption` dp
+  ON
+    dac.dc_contract_code = dp.`Contract Code`
+  JOIN
+    Top20ProductsList tp
+  ON
+    dp.`Data Product Name` = tp.dc_data_product_name
+  GROUP BY
+    dac.dc_month, dac.dc_publisher
+)
+
+-- Final select statement to combine all the calculated fields with a unique ID
+SELECT
+  ROW_NUMBER() OVER() AS dc_id,  -- Generate a unique ID for each row
+  acm.dc_publisher,
+  acm.dc_month,
+  acm.dc_active_contracts,
+  COALESCE(mom.dc_mom_percentage_increase, 0) AS dc_mom_percentage_increase,
+  COALESCE(ndp.dc_new_data_products, '') AS dc_new_data_products,
+  COALESCE(tp.dc_top_20_products_count, 0) AS dc_top_20_products_count
+FROM
+  ActiveContractsMonthly acm
+LEFT JOIN
+  MoMIncrease mom
+ON
+  acm.dc_publisher = mom.dc_publisher AND acm.dc_month = mom.dc_month
+LEFT JOIN
+  NewDataProducts ndp
+ON
+  acm.dc_publisher = ndp.dc_publisher AND acm.dc_month = ndp.dc_month
+LEFT JOIN
+  Top20ProductsMonthly tp
+ON
+  acm.dc_publisher = tp.dc_publisher AND acm.dc_month = tp.dc_month
+ORDER BY
+  acm.dc_publisher, acm.dc_month;  -- Order the result by publisher and month
