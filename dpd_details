@@ -1,81 +1,98 @@
--- Generate a range of dates from '2023-01-01' to the current date, truncated to the start of each month
-WITH date_range AS (
-  SELECT DATE_ADD(DATE('2023-01-01'), INTERVAL month MONTH) AS dpd_month
-  FROM UNNEST(GENERATE_ARRAY(0, DATE_DIFF(CURRENT_DATE(), DATE('2023-01-01'), MONTH))) AS month
+CREATE OR REPLACE TABLE `rdmga4.RDMreports.dpd_details` AS
+    -- Generate a calendar table with all required months
+WITH Calendar AS (
+    SELECT 
+        DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL x MONTH) AS Month_Year
+    FROM 
+        UNNEST(GENERATE_ARRAY(0, 23)) AS x -- Adjust the range to include the desired number of months (e.g., last 24 months)
 ),
 
--- Calculate the monthly product counts for each organization
-MonthlyProductCounts AS (
-  SELECT `Organization Name` AS dpd_organization_name, 
-         DATE_TRUNC(DATE(`Published Date`), MONTH) AS dpd_month,
-         COUNT(DISTINCT `Data Product Code`) AS dpd_product_count
-  FROM `rdmga4.RDMreports.Data Product Details Live`
-  WHERE DATE(`Published Date`) >= DATE('2023-01-01')
-    AND DATE(`Published Date`) < DATE_ADD(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 1 MONTH)
-  GROUP BY `Organization Name`, dpd_month
+-- KPI 1: Number of Active Products by Organization and Month
+KPI1 AS (
+    SELECT 
+        CAST(FORMAT_DATE('%Y-%m-01', `Published Date`) AS DATE) AS Month_Year,
+        `Organization Name` AS dpd_Organization_Name,
+        COUNT(DISTINCT `Product Series Code`) AS dpd_Number_of_Products
+    FROM `rdmga4.RDMreports.raw_data_product_details` AS dpd_details
+    WHERE 
+        `State` = 'active' 
+        AND `Is Latest Version` = TRUE
+    GROUP BY Month_Year, dpd_Organization_Name
 ),
 
--- Get a distinct list of organizations
-AllOrganizationsMonths AS (
-  SELECT DISTINCT dpd_organization_name
-  FROM MonthlyProductCounts
+-- KPI 2: First Version Counts of Active Data Products by Organization and Month
+ActiveProducts AS (
+    SELECT DISTINCT `Organization Name` AS dpd_Organization_Name, `Data Product Name` AS dpd_Data_Product_Name
+    FROM `rdmga4.RDMreports.raw_data_product_details` AS dpd_details
+    WHERE `State` = 'active'
+),
+FirstVersions AS (
+    SELECT
+        dpd_details.`Organization Name` AS dpd_Organization_Name,
+        dpd_details.`Data Product Code` AS dpd_Data_Product_Code,
+        dpd_details.`Published Date` AS dpd_Published_Date,
+        dpd_details.`Data Product Name` AS dpd_Data_Product_Name,
+        dpd_details.`Version number` AS dpd_Version_Number,
+        CAST(FORMAT_DATE('%Y-%m-01', dpd_details.`Published Date`) AS DATE) AS dpd_Month_Year
+    FROM
+        `rdmga4.RDMreports.raw_data_product_details` AS dpd_details
+    JOIN
+        ActiveProducts AS active
+    ON
+        dpd_details.`Organization Name` = active.dpd_Organization_Name
+        AND dpd_details.`Data Product Name` = active.dpd_Data_Product_Name
+    QUALIFY 
+        ROW_NUMBER() OVER (
+            PARTITION BY dpd_details.`Organization Name`, dpd_details.`Data Product Name` 
+            ORDER BY dpd_details.`Published Date`
+        ) = 1
+),
+KPI2 AS (
+    SELECT
+        CAST(FORMAT_DATE('%Y-%m-01', dpd_Month_Year) AS DATE) AS Month_Year,
+        dpd_Organization_Name,
+        COUNT(DISTINCT dpd_Data_Product_Code) AS dpd_Number_of_Products_per_month
+    FROM
+        FirstVersions
+    GROUP BY
+        Month_Year,
+        dpd_Organization_Name
 ),
 
--- Calculate cumulative product counts for each organization over time
-CumulativeProductCounts AS (
-  SELECT dpd_ao.dpd_organization_name, dpd_dr.dpd_month,
-         COALESCE(dpd_mpc.dpd_product_count, 0) AS dpd_product_count,
-         SUM(COALESCE(dpd_mpc.dpd_product_count, 0)) OVER (PARTITION BY dpd_ao.dpd_organization_name ORDER BY dpd_dr.dpd_month) AS dpd_cumulative_product_count
-  FROM AllOrganizationsMonths dpd_ao
-  CROSS JOIN date_range dpd_dr
-  LEFT JOIN MonthlyProductCounts dpd_mpc ON dpd_ao.dpd_organization_name = dpd_mpc.dpd_organization_name AND dpd_dr.dpd_month = dpd_mpc.dpd_month
-),
-
--- Calculate total cumulative product counts across all organizations for each month
-TotalCumulativeProductCounts AS (
-  SELECT dpd_month, 
-         SUM(dpd_product_count) AS dpd_total_monthly_product_count,
-         SUM(SUM(dpd_product_count)) OVER (ORDER BY dpd_month) AS dpd_total_cumulative_product_count
-  FROM CumulativeProductCounts
-  GROUP BY dpd_month
-),
-
--- Calculate the percentage of total cumulative product count for each organization
-PercentageCalculations AS (
-  SELECT dpd_cpc.dpd_organization_name, dpd_cpc.dpd_month, dpd_cpc.dpd_product_count, dpd_cpc.dpd_cumulative_product_count,
-         dpd_tcp.dpd_total_cumulative_product_count,
-         ROUND(
-           CASE 
-             WHEN dpd_tcp.dpd_total_cumulative_product_count = 0 THEN 0
-             ELSE (dpd_cpc.dpd_cumulative_product_count / dpd_tcp.dpd_total_cumulative_product_count) * 100
-           END, 2) AS dpd_percentage_of_total
-  FROM CumulativeProductCounts dpd_cpc
-  JOIN TotalCumulativeProductCounts dpd_tcp ON dpd_cpc.dpd_month = dpd_tcp.dpd_month
-),
-
--- Calculate the month-over-month percentage increase in cumulative product count for each organization
-PercentageIncrease AS (
-  SELECT dpd_pc.dpd_organization_name, dpd_pc.dpd_month, dpd_pc.dpd_product_count, dpd_pc.dpd_cumulative_product_count,
-         LAG(dpd_pc.dpd_cumulative_product_count) OVER (PARTITION BY dpd_pc.dpd_organization_name ORDER BY dpd_pc.dpd_month) AS dpd_previous_cumulative_product_count,
-         ROUND(
-           CASE
-             WHEN LAG(dpd_pc.dpd_cumulative_product_count) OVER (PARTITION BY dpd_pc.dpd_organization_name ORDER BY dpd_pc.dpd_month) = 0 THEN 0
-             ELSE ((dpd_pc.dpd_cumulative_product_count - LAG(dpd_pc.dpd_cumulative_product_count) OVER (PARTITION BY dpd_pc.dpd_organization_name ORDER BY dpd_pc.dpd_month)) /
-                   LAG(dpd_pc.dpd_cumulative_product_count) OVER (PARTITION BY dpd_pc.dpd_organization_name ORDER BY dpd_pc.dpd_month)) * 100
-           END, 2) AS dpd_monthly_percentage_increase,
-         ROUND(dpd_pc.dpd_percentage_of_total, 2) AS dpd_percentage_of_total
-  FROM PercentageCalculations dpd_pc
+-- Combine Calendar with KPI1 and KPI2
+Combined AS (
+    SELECT
+        cal.Month_Year,
+        org.dpd_Organization_Name,
+        IFNULL(KPI1.dpd_Number_of_Products, 0) AS dpd_Number_of_Products,
+        IFNULL(KPI2.dpd_Number_of_Products_per_month, 0) AS dpd_Number_of_Products_per_month
+    FROM
+        Calendar AS cal
+    CROSS JOIN (
+        SELECT DISTINCT `Organization Name` AS dpd_Organization_Name
+        FROM `rdmga4.RDMreports.raw_data_product_details`
+    ) AS org
+    LEFT JOIN
+        KPI1
+    ON
+        cal.Month_Year = KPI1.Month_Year
+        AND org.dpd_Organization_Name = KPI1.dpd_Organization_Name
+    LEFT JOIN
+        KPI2
+    ON
+        cal.Month_Year = KPI2.Month_Year
+        AND org.dpd_Organization_Name = KPI2.dpd_Organization_Name
 )
 
--- Final select statement to get the desired fields with a unique ID
-SELECT 
-  ROW_NUMBER() OVER() AS dpd_id,  -- Generate a unique ID for each row
-  dpd_organization_name, 
-  dpd_month, 
-  dpd_product_count, 
-  dpd_cumulative_product_count,
-  dpd_monthly_percentage_increase, 
-  dpd_percentage_of_total
-FROM PercentageIncrease
-WHERE dpd_organization_name IS NOT NULL  -- Filter out rows with NULL organization name
-ORDER BY dpd_organization_name, dpd_month;  -- Order the result by organization name and month
+-- Final Result
+SELECT
+    ROW_NUMBER() OVER (ORDER BY Month_Year, dpd_Organization_Name) AS dpd_id,
+    Month_Year,
+    dpd_Organization_Name,
+    dpd_Number_of_Products,
+    dpd_Number_of_Products_per_month
+FROM
+    Combined
+ORDER BY
+    Month_Year,
+    dpd_Organization_Name;
