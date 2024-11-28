@@ -1,10 +1,40 @@
---- ppm numbers look correct
-
 WITH monthly_dates AS (
     SELECT 
         CAST(FORMAT_DATE('%Y-%m-01', DATE(month_date)) AS DATE) AS month_date
     FROM 
         UNNEST(GENERATE_DATE_ARRAY('2023-01-01', CURRENT_DATE(), INTERVAL 1 MONTH)) AS month_date
+),
+
+inactive_contracts_all_time AS (
+    SELECT 
+        c.`Contract Code` AS contract_code,
+        c.`Buyer BPID` AS buyer_bpid
+    FROM 
+        `rdmga4.RDMreports.contracts` AS c
+    LEFT JOIN 
+        `rdmga4.RDMreports.daily_consumption` AS dc
+    ON 
+        c.`Contract Code` = dc.`Contract Code`
+        AND (COALESCE(dc.`Total number of Hits`, 0) > 0 
+             OR COALESCE(dc.`Total Volume Consumed in Bytes`, 0) > 0)
+    WHERE 
+        dc.`Contract Code` IS NULL -- No API activity found for this contract
+),
+
+active_contracts_all_time AS (
+    SELECT 
+        c.`Contract Code` AS contract_code,
+        c.`Buyer BPID` AS buyer_bpid
+    FROM 
+        `rdmga4.RDMreports.contracts` AS c
+    JOIN 
+        `rdmga4.RDMreports.daily_consumption` AS dc
+    ON 
+        c.`Contract Code` = dc.`Contract Code`
+        AND (COALESCE(dc.`Total number of Hits`, 0) > 0 
+             OR COALESCE(dc.`Total Volume Consumed in Bytes`, 0) > 0)
+    GROUP BY 
+        c.`Contract Code`, c.`Buyer BPID` -- Ensure no duplicates
 )
 
 SELECT 
@@ -13,24 +43,24 @@ SELECT
     ro_buyer.`Organization Name` AS ppm_consumer,
     c.`Data Product Name` AS ppm_product,
     md.month_date AS ppm_month,
-    
-    -- Active and Inactive Contracts
-    COUNT(DISTINCT CASE 
-        WHEN COALESCE(dc.`Total number of Hits`, 0) > 0 
-             OR COALESCE(dc.`Total Volume Consumed in Bytes`, 0) > 0 
-        THEN c.`Contract Code`
-    END) AS ppm_active_contracts,
-    COUNT(DISTINCT CASE 
-        WHEN COALESCE(dc.`Total number of Hits`, 0) = 0 
-             AND COALESCE(dc.`Total Volume Consumed in Bytes`, 0) = 0 
-        THEN c.`Contract Code`
-    END) AS ppm_inactive_contracts,
 
-    -- Total API Calls and Volume
+    -- Consumers Who Never Made an API Call Across All Time
+    COUNT(DISTINCT CASE 
+        WHEN c.`Contract Code` IN (SELECT contract_code FROM inactive_contracts_all_time)
+        THEN c.`Buyer BPID`
+    END) AS ppm_users_no_api_calls_all_time,
+
+    -- Consumers Who Made At Least One API Call Across All Time
+    COUNT(DISTINCT CASE 
+        WHEN c.`Contract Code` IN (SELECT contract_code FROM active_contracts_all_time)
+        THEN c.`Buyer BPID`
+    END) AS ppm_users_with_api_calls_all_time,
+
+    -- Total API Calls and Volume (Optional for context)
     SUM(COALESCE(dc.`Total number of Hits`, 0)) AS ppm_total_hits,
     SUM(COALESCE(dc.`Total Volume Consumed in Bytes`, 0)) AS ppm_total_volume,
 
-    -- Total Consumers
+    -- Total Consumers (Monthly Context)
     COUNT(DISTINCT CASE 
         WHEN md.month_date BETWEEN DATE_TRUNC(c.`Contract Start Date`, MONTH) 
                                AND COALESCE(DATE_TRUNC(c.`Contract Expiry Date`, MONTH), md.month_date)
