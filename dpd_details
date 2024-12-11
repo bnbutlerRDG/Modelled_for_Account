@@ -1,98 +1,131 @@
 CREATE OR REPLACE TABLE `rdmga4.RDMreports.dpd_details` AS
-    -- Generate a calendar table with all required months
-WITH Calendar AS (
+
+WITH Product_Details AS (
     SELECT 
-        DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL x MONTH) AS Month_Year
+        `Product Series Code`,
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
+        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
+        `Version Number`,
+        `State`
     FROM 
-        UNNEST(GENERATE_ARRAY(0, 23)) AS x -- Adjust the range to include the desired number of months (e.g., last 24 months)
-),
-
--- KPI 1: Number of Active Products by Organization and Month
-KPI1 AS (
-    SELECT 
-        CAST(FORMAT_DATE('%Y-%m-01', `Published Date`) AS DATE) AS Month_Year,
-        `Organization Name` AS dpd_Organization_Name,
-        COUNT(DISTINCT `Product Series Code`) AS dpd_Number_of_Products
-    FROM `rdmga4.RDMreports.raw_data_product_details` AS dpd_details
+        `rdmga4.RDMreports.raw_data_product_details`
     WHERE 
-        `State` = 'active' 
-        AND `Is Latest Version` = TRUE
-    GROUP BY Month_Year, dpd_Organization_Name
+        `State` IN ('active', 'expired') -- Include both active and expired products
 ),
 
--- KPI 2: First Version Counts of Active Data Products by Organization and Month
-ActiveProducts AS (
-    SELECT DISTINCT `Organization Name` AS dpd_Organization_Name, `Data Product Name` AS dpd_Data_Product_Name
-    FROM `rdmga4.RDMreports.raw_data_product_details` AS dpd_details
-    WHERE `State` = 'active'
-),
-FirstVersions AS (
-    SELECT
-        dpd_details.`Organization Name` AS dpd_Organization_Name,
-        dpd_details.`Data Product Code` AS dpd_Data_Product_Code,
-        dpd_details.`Published Date` AS dpd_Published_Date,
-        dpd_details.`Data Product Name` AS dpd_Data_Product_Name,
-        dpd_details.`Version number` AS dpd_Version_Number,
-        CAST(FORMAT_DATE('%Y-%m-01', dpd_details.`Published Date`) AS DATE) AS dpd_Month_Year
-    FROM
-        `rdmga4.RDMreports.raw_data_product_details` AS dpd_details
-    JOIN
-        ActiveProducts AS active
-    ON
-        dpd_details.`Organization Name` = active.dpd_Organization_Name
-        AND dpd_details.`Data Product Name` = active.dpd_Data_Product_Name
-    QUALIFY 
-        ROW_NUMBER() OVER (
-            PARTITION BY dpd_details.`Organization Name`, dpd_details.`Data Product Name` 
-            ORDER BY dpd_details.`Published Date`
-        ) = 1
-),
-KPI2 AS (
-    SELECT
-        CAST(FORMAT_DATE('%Y-%m-01', dpd_Month_Year) AS DATE) AS Month_Year,
-        dpd_Organization_Name,
-        COUNT(DISTINCT dpd_Data_Product_Code) AS dpd_Number_of_Products_per_month
-    FROM
-        FirstVersions
-    GROUP BY
-        Month_Year,
-        dpd_Organization_Name
+Contract_Details AS (
+    SELECT 
+        `Product Series Code`,
+        SAFE_CAST(`Sunsetting Date` AS DATE) AS Sunsetting_Date,
+        CAST(`Seller BPID` AS STRING) AS Seller_BPID -- Cast Seller BPID to STRING
+    FROM 
+        `rdmga4.RDMreports.contracts`
 ),
 
--- Combine Calendar with KPI1 and KPI2
-Combined AS (
-    SELECT
-        cal.Month_Year,
-        org.dpd_Organization_Name,
-        IFNULL(KPI1.dpd_Number_of_Products, 0) AS dpd_Number_of_Products,
-        IFNULL(KPI2.dpd_Number_of_Products_per_month, 0) AS dpd_Number_of_Products_per_month
-    FROM
-        Calendar AS cal
-    CROSS JOIN (
-        SELECT DISTINCT `Organization Name` AS dpd_Organization_Name
-        FROM `rdmga4.RDMreports.raw_data_product_details`
-    ) AS org
-    LEFT JOIN
-        KPI1
-    ON
-        cal.Month_Year = KPI1.Month_Year
-        AND org.dpd_Organization_Name = KPI1.dpd_Organization_Name
-    LEFT JOIN
-        KPI2
-    ON
-        cal.Month_Year = KPI2.Month_Year
-        AND org.dpd_Organization_Name = KPI2.dpd_Organization_Name
+Organization_Details AS (
+    SELECT 
+        CAST(`BPID` AS STRING) AS Publisher_BPID, -- Cast BPID to STRING
+        `Organization Name` AS Publisher_Organization_Name
+    FROM 
+        `rdmga4.RDMreports.raw_organization_overview`
+),
+
+Combined_Product_Data AS (
+    SELECT 
+        pd.`Product Series Code`,
+        pd.Data_Product_Name,
+        pd.Published_Date,
+        pd.`Version Number`,
+        cd.Sunsetting_Date,
+        org.Publisher_Organization_Name,
+        pd.State
+    FROM 
+        Product_Details pd
+    INNER JOIN 
+        Contract_Details cd
+    ON 
+        pd.`Product Series Code` = cd.`Product Series Code`
+    LEFT JOIN 
+        Organization_Details org
+    ON 
+        cd.Seller_BPID = org.Publisher_BPID -- Match using consistent data type (STRING)
+),
+
+Active_Periods AS (
+    SELECT 
+        `Product Series Code`,
+        Data_Product_Name,
+        Publisher_Organization_Name,
+        COALESCE(Published_Date, DATE('2023-01-01')) AS Start_Date,
+        CASE 
+            WHEN State = 'expired' THEN Sunsetting_Date
+            ELSE DATE_TRUNC(CURRENT_DATE(), MONTH) -- Dynamically extend to the current month
+        END AS End_Date
+    FROM 
+        Combined_Product_Data
+    WHERE 
+        Sunsetting_Date IS NULL OR Sunsetting_Date >= DATE('2023-01-01')
+),
+
+Expanded_Active_Periods AS (
+    SELECT 
+        `Product Series Code`,
+        Data_Product_Name,
+        Publisher_Organization_Name,
+        ACTIVE_MONTH AS Active_Month
+    FROM 
+        Active_Periods,
+        UNNEST(
+            GENERATE_DATE_ARRAY(
+                DATE_TRUNC(Start_Date, MONTH),
+                LEAST(DATE_TRUNC(End_Date, MONTH), DATE_TRUNC(CURRENT_DATE(), MONTH)), -- Restrict to current month
+                INTERVAL 1 MONTH
+            )
+        ) AS ACTIVE_MONTH
+),
+
+First_Active_Month AS (
+    SELECT 
+        `Product Series Code`,
+        Data_Product_Name,
+        Publisher_Organization_Name,
+        DATE_TRUNC(MIN(Start_Date), MONTH) AS First_Active_Month
+    FROM 
+        Active_Periods
+    GROUP BY 
+        `Product Series Code`, Data_Product_Name, Publisher_Organization_Name
+),
+
+Monthly_Products AS (
+    SELECT 
+        eap.Active_Month,
+        eap.Publisher_Organization_Name,
+        COUNT(DISTINCT eap.`Product Series Code`) AS Products_Active_Count,
+        ARRAY_AGG(DISTINCT eap.Data_Product_Name) AS Active_Product_Names,
+        COUNT(DISTINCT CASE WHEN eap.Active_Month = fam.First_Active_Month THEN eap.`Product Series Code` END) AS Products_Added_Count,
+        ARRAY_AGG(DISTINCT CASE 
+            WHEN eap.Active_Month = fam.First_Active_Month THEN eap.Data_Product_Name 
+            ELSE NULL 
+        END IGNORE NULLS) AS Added_Product_Names
+    FROM 
+        Expanded_Active_Periods eap
+    LEFT JOIN 
+        First_Active_Month fam
+    ON 
+        eap.`Product Series Code` = fam.`Product Series Code`
+        AND eap.Publisher_Organization_Name = fam.Publisher_Organization_Name
+    GROUP BY 
+        eap.Active_Month, eap.Publisher_Organization_Name
+    ORDER BY 
+        eap.Active_Month, eap.Publisher_Organization_Name
 )
 
--- Final Result
-SELECT
-    ROW_NUMBER() OVER (ORDER BY Month_Year, dpd_Organization_Name) AS dpd_id,
-    Month_Year,
-    dpd_Organization_Name,
-    dpd_Number_of_Products,
-    dpd_Number_of_Products_per_month
-FROM
-    Combined
-ORDER BY
-    Month_Year,
-    dpd_Organization_Name;
+SELECT 
+    DATE_TRUNC(Active_Month, MONTH) AS Month, -- Ensure Month is a true DATE type
+    Publisher_Organization_Name,
+    Products_Active_Count,
+    Active_Product_Names,
+    Products_Added_Count,
+    Added_Product_Names
+FROM 
+    Monthly_Products;
