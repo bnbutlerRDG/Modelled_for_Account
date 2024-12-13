@@ -1,3 +1,4 @@
+CREATE OR REPLACE TABLE rdmga4.RDMreports.ppm_metrics AS
 WITH monthly_dates AS (
     SELECT 
         CAST(FORMAT_DATE('%Y-%m-01', DATE(month_date)) AS DATE) AS month_date
