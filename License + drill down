@@ -1,0 +1,193 @@
+-- Correct Combined Dataset for Tableau License + drill down for 1,2,3 + KPI  5
+WITH Product_Details AS (
+    SELECT 
+        `Product Series Code`,
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
+        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
+        `Version Number`,
+        `License Type`,
+        `State`
+    FROM 
+        `rdmga4.RDMreports.raw_data_product_details`
+    WHERE 
+        `State` = 'active' -- Only active products
+),
+
+Latest_Version AS (
+    SELECT 
+        `Product Series Code`,
+        MAX(SAFE_CAST(`Version Number` AS FLOAT64)) AS Max_Version
+    FROM 
+        `rdmga4.RDMreports.raw_data_product_details`
+    GROUP BY 
+        `Product Series Code`
+),
+
+Filtered_Products AS (
+    SELECT 
+        pd.`Product Series Code`,
+        pd.Data_Product_Name,
+        pd.Published_Date,
+        pd.`Version Number`,
+        pd.`License Type`
+    FROM 
+        Product_Details pd
+    JOIN 
+        Latest_Version lv
+    ON 
+        pd.`Product Series Code` = lv.`Product Series Code`
+        AND SAFE_CAST(pd.`Version Number` AS FLOAT64) = lv.Max_Version
+),
+
+Consumer_Details AS (
+    SELECT 
+        DISTINCT cons.`Organization Name` AS Consumer_Name,
+        SAFE_CAST(cons.`Request approved at` AS DATE) AS Consumer_Join_Date
+    FROM 
+        `rdmga4.RDMreports.raw_organization_overview` cons
+    WHERE 
+        cons.`Request approved at` IS NOT NULL
+),
+
+Publisher_Details AS (
+    SELECT 
+        DISTINCT pub.`Organization Name` AS Publisher_Name,
+        SAFE_CAST(pub.`Upgrade request approval date` AS DATE) AS Publisher_Join_Date
+    FROM 
+        `rdmga4.RDMreports.consumer_to_publisher` pub
+    WHERE 
+        pub.`Upgrade request approval date` IS NOT NULL
+),
+
+Combined_Data AS (
+    SELECT 
+        Data_Product_Name AS Name,
+        Published_Date AS Join_Date,
+        `Version Number` AS Version,
+        `License Type` AS License_Type,
+        'Product' AS Type
+    FROM 
+        Filtered_Products
+
+    UNION ALL
+
+    SELECT 
+        Consumer_Name AS Name,
+        Consumer_Join_Date AS Join_Date,
+        NULL AS Version,
+        NULL AS License_Type,
+        'Consumer' AS Type
+    FROM 
+        Consumer_Details
+
+    UNION ALL
+
+    SELECT 
+        Publisher_Name AS Name,
+        Publisher_Join_Date AS Join_Date,
+        NULL AS Version,
+        NULL AS License_Type,
+        'Publisher' AS Type
+    FROM 
+        Publisher_Details
+)
+
+SELECT *
+FROM Combined_Data
+ORDER BY Join_Date, Type, Name;-- Correct Combined Dataset for Tableau License + drill down for 1,2,3 + KPI  5
+WITH Product_Details AS (
+    SELECT 
+        `Product Series Code`,
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
+        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
+        `Version Number`,
+        `License Type`,
+        `State`
+    FROM 
+        `rdmga4.RDMreports.raw_data_product_details`
+    WHERE 
+        `State` = 'active' -- Only active products
+),
+
+Latest_Version AS (
+    SELECT 
+        `Product Series Code`,
+        MAX(SAFE_CAST(`Version Number` AS FLOAT64)) AS Max_Version
+    FROM 
+        `rdmga4.RDMreports.raw_data_product_details`
+    GROUP BY 
+        `Product Series Code`
+),
+
+Filtered_Products AS (
+    SELECT 
+        pd.`Product Series Code`,
+        pd.Data_Product_Name,
+        pd.Published_Date,
+        pd.`Version Number`,
+        pd.`License Type`
+    FROM 
+        Product_Details pd
+    JOIN 
+        Latest_Version lv
+    ON 
+        pd.`Product Series Code` = lv.`Product Series Code`
+        AND SAFE_CAST(pd.`Version Number` AS FLOAT64) = lv.Max_Version
+),
+
+Consumer_Details AS (
+    SELECT 
+        DISTINCT cons.`Organization Name` AS Consumer_Name,
+        SAFE_CAST(cons.`Request approved at` AS DATE) AS Consumer_Join_Date
+    FROM 
+        `rdmga4.RDMreports.raw_organization_overview` cons
+    WHERE 
+        cons.`Request approved at` IS NOT NULL
+),
+
+Publisher_Details AS (
+    SELECT 
+        DISTINCT pub.`Organization Name` AS Publisher_Name,
+        SAFE_CAST(pub.`Upgrade request approval date` AS DATE) AS Publisher_Join_Date
+    FROM 
+        `rdmga4.RDMreports.consumer_to_publisher` pub
+    WHERE 
+        pub.`Upgrade request approval date` IS NOT NULL
+),
+
+Combined_Data AS (
+    SELECT 
+        Data_Product_Name AS Name,
+        Published_Date AS Join_Date,
+        `Version Number` AS Version,
+        `License Type` AS License_Type,
+        'Product' AS Type
+    FROM 
+        Filtered_Products
+
+    UNION ALL
+
+    SELECT 
+        Consumer_Name AS Name,
+        Consumer_Join_Date AS Join_Date,
+        NULL AS Version,
+        NULL AS License_Type,
+        'Consumer' AS Type
+    FROM 
+        Consumer_Details
+
+    UNION ALL
+
+    SELECT 
+        Publisher_Name AS Name,
+        Publisher_Join_Date AS Join_Date,
+        NULL AS Version,
+        NULL AS License_Type,
+        'Publisher' AS Type
+    FROM 
+        Publisher_Details
+)
+
+SELECT *
+FROM Combined_Data
+ORDER BY Join_Date, Type, Name;
