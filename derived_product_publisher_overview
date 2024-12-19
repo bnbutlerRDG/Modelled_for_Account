@@ -1,1 +1,180 @@
+-- Correct New dppo looks like counts are correct and monthly data - this is cumulative but it works fine KPI 1,2,3
+WITH Date_Range AS (
+    SELECT 
+        MIN(SAFE_CAST(`Request approved at` AS DATE)) AS Min_Date,
+        MAX(SAFE_CAST(`Request approved at` AS DATE)) AS Max_Date
+    FROM 
+        `rdmga4.RDMreports.raw_organization_overview`
+),
 
+Product_Details AS (
+    SELECT 
+        `Product Series Code`,
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
+        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
+        `Version Number`,
+        `State`
+    FROM 
+        `rdmga4.RDMreports.raw_data_product_details`
+    WHERE 
+        `State` IN ('active', 'expired')
+),
+
+Contract_Details AS (
+    SELECT 
+        `Product Series Code`,
+        SAFE_CAST(`Sunsetting Date` AS DATE) AS Sunsetting_Date,
+        CAST(`Seller BPID` AS STRING) AS Seller_BPID,
+        CAST(`Buyer BPID` AS STRING) AS Buyer_BPID
+    FROM 
+        `rdmga4.RDMreports.contracts`
+),
+
+Organization_Details AS (
+    SELECT 
+        CAST(`BPID` AS STRING) AS BPID,
+        `Organization Name`,
+        SAFE_CAST(`Request approved at` AS DATE) AS Consumer_Approval_Date,
+        `Status` AS Approval_Status
+    FROM 
+        `rdmga4.RDMreports.raw_organization_overview`
+    WHERE 
+        `Request approved at` IS NOT NULL
+),
+
+Consumer_To_Publisher AS (
+    SELECT 
+        CAST(`BPID` AS STRING) AS BPID,
+        `Organization Name`,
+        SAFE_CAST(`Upgrade request approval date` AS DATE) AS Publisher_Approval_Date,
+        `Upgrade Status`
+    FROM 
+        `rdmga4.RDMreports.consumer_to_publisher`
+    WHERE 
+        `Upgrade request approval date` IS NOT NULL
+),
+
+Combined_Product_Data AS (
+    SELECT DISTINCT
+        pd.`Product Series Code`,
+        pd.Data_Product_Name,
+        pd.Published_Date,
+        pd.`Version Number`,
+        cd.Sunsetting_Date,
+        pub_org.`Organization Name` AS Publisher_Organization_Name,
+        cons_org.`Organization Name` AS Consumer_Organization_Name,
+        pd.State
+    FROM 
+        Product_Details pd
+    LEFT JOIN 
+        Contract_Details cd
+    ON 
+        pd.`Product Series Code` = cd.`Product Series Code`
+    LEFT JOIN 
+        Organization_Details pub_org
+    ON 
+        cd.Seller_BPID = pub_org.BPID
+    LEFT JOIN 
+        Organization_Details cons_org
+    ON 
+        cd.Buyer_BPID = cons_org.BPID
+),
+
+Active_Periods AS (
+    SELECT 
+        `Product Series Code`,
+        Data_Product_Name,
+        Publisher_Organization_Name,
+        Consumer_Organization_Name,
+        COALESCE(Published_Date, DATE('2023-01-01')) AS Start_Date,
+        CASE 
+            WHEN State = 'expired' THEN Sunsetting_Date
+            ELSE DATE_TRUNC(CURRENT_DATE(), MONTH)
+        END AS End_Date
+    FROM 
+        Combined_Product_Data
+    WHERE 
+        Sunsetting_Date IS NULL OR Sunsetting_Date >= DATE('2023-01-01')
+),
+
+Expanded_Active_Periods AS (
+    SELECT 
+        `Product Series Code`,
+        Data_Product_Name,
+        Publisher_Organization_Name,
+        Consumer_Organization_Name,
+        ACTIVE_MONTH AS Active_Month
+    FROM 
+        Active_Periods,
+        UNNEST(
+            GENERATE_DATE_ARRAY(
+                DATE_TRUNC(Start_Date, MONTH),
+                LEAST(DATE_TRUNC(End_Date, MONTH), DATE_TRUNC(CURRENT_DATE(), MONTH)),
+                INTERVAL 1 MONTH
+            )
+        ) AS ACTIVE_MONTH
+),
+
+Monthly_Stats AS (
+    SELECT 
+        eap.Active_Month,
+        COUNT(DISTINCT eap.Publisher_Organization_Name) AS Distinct_Publisher_Count,
+        COUNT(DISTINCT eap.Consumer_Organization_Name) AS Distinct_Consumer_Count,
+        COUNT(DISTINCT eap.`Product Series Code`) AS Products_Active_Count
+    FROM 
+        Expanded_Active_Periods eap
+    GROUP BY 
+        eap.Active_Month
+),
+
+Monthly_Approval_Counts AS (
+    SELECT 
+        Month,
+        COUNT(DISTINCT CASE WHEN Consumer_Approval_Date <= Month THEN od.BPID END) AS Approved_Consumers,
+        COUNT(DISTINCT CASE WHEN Publisher_Approval_Date <= Month THEN ctp.BPID END) AS Approved_Publishers
+    FROM (
+        SELECT 
+            GENERATE_DATE_ARRAY(
+                (SELECT Min_Date FROM Date_Range), 
+                (SELECT DATE_ADD(Max_Date, INTERVAL 1 MONTH) FROM Date_Range)
+            ) AS Month
+    ), UNNEST(Month) AS Month
+    LEFT JOIN Organization_Details od ON od.Consumer_Approval_Date IS NOT NULL
+    LEFT JOIN Consumer_To_Publisher ctp ON ctp.Publisher_Approval_Date IS NOT NULL
+    GROUP BY 
+        Month
+),
+
+Comprehensive_Counts AS (
+    SELECT
+        COUNT(DISTINCT cpd.Publisher_Organization_Name) AS Publishers_In_Contracts,
+        COUNT(DISTINCT pd.`Product Series Code`) AS Unique_Products
+    FROM 
+        Organization_Details od
+    LEFT JOIN 
+        Combined_Product_Data cpd
+    ON 
+        od.BPID = cpd.Publisher_Organization_Name
+    LEFT JOIN 
+        Product_Details pd
+    ON 
+        pd.`Product Series Code` = cpd.`Product Series Code`
+)
+
+SELECT 
+    DATE_TRUNC(ms.Active_Month, MONTH) AS Month,
+    ms.Distinct_Publisher_Count,
+    ms.Distinct_Consumer_Count,
+    ms.Products_Active_Count,
+    COALESCE(mac.Approved_Consumers, 0) AS Approved_Consumers,
+    cc.Publishers_In_Contracts,
+    COALESCE(mac.Approved_Publishers, 0) AS Approved_Publishers,
+    cc.Unique_Products
+FROM 
+    Monthly_Stats ms
+CROSS JOIN 
+    Comprehensive_Counts cc
+LEFT JOIN 
+    Monthly_Approval_Counts mac ON DATE_TRUNC(ms.Active_Month, MONTH) = mac.Month
+ORDER BY 
+    Month;
