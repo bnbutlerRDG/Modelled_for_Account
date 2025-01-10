@@ -1,1 +1,99 @@
-
+-- Generate a summary table for active and expired data connections with deduplication
+WITH Months AS (
+  -- Generate a list of months to evaluate
+  SELECT 
+    DATE_TRUNC(DATE_ADD(DATE('2023-01-01'), INTERVAL n MONTH), MONTH) AS Month_Start
+  FROM 
+    UNNEST(GENERATE_ARRAY(0, DATE_DIFF(CURRENT_DATE(), DATE('2023-01-01'), MONTH))) AS n
+),
+DeduplicatedContracts AS (
+  -- Deduplicate contracts to ensure only one entry per Buyer BPID and Contract Series Code
+  SELECT
+    `Buyer BPID`,
+    `Contract Series Code`,
+    `Contract Start Date`,
+    `Contract Expiry Date`,
+    ROW_NUMBER() OVER (
+      PARTITION BY `Buyer BPID`, `Contract Series Code`
+      ORDER BY `Contract Start Date` ASC
+    ) AS RowNum
+  FROM
+    rdmga4.RDMreports.contracts
+  WHERE
+    `Contract Start Date` IS NOT NULL AND `Contract Expiry Date` IS NOT NULL
+),
+ActiveConnections AS (
+  -- Identify active connections for each month
+  SELECT
+    DATE_TRUNC(`Contract Start Date`, MONTH) AS Active_Month,
+    COUNT(DISTINCT CONCAT(`Buyer BPID`, '-', `Contract Series Code`)) AS Active_Count
+  FROM
+    DeduplicatedContracts
+  WHERE
+    RowNum = 1
+  GROUP BY
+    Active_Month
+),
+ExpiredConnections AS (
+  -- Identify expired connections for the month after they expire
+  SELECT
+    DATE_TRUNC(DATE_ADD(`Contract Expiry Date`, INTERVAL 1 MONTH), MONTH) AS Expired_Month,
+    COUNT(DISTINCT CONCAT(`Buyer BPID`, '-', `Contract Series Code`)) AS Expired_Count
+  FROM
+    DeduplicatedContracts
+  WHERE
+    RowNum = 1
+  GROUP BY
+    Expired_Month
+),
+MonthlySummary AS (
+  -- Combine active and expired counts by month
+  SELECT
+    m.Month_Start AS Date,
+    COALESCE(a.Active_Count, 0) AS Active,
+    COALESCE(e.Expired_Count, 0) AS Expired
+  FROM
+    Months m
+    LEFT JOIN ActiveConnections a ON m.Month_Start = a.Active_Month
+    LEFT JOIN ExpiredConnections e ON m.Month_Start = e.Expired_Month
+),
+CumulativeActive AS (
+  -- Calculate cumulative active connections
+  SELECT
+    Date,
+    SUM(Active) OVER (ORDER BY Date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS Cumulative_Active
+  FROM
+    MonthlySummary
+),
+CumulativeExpired AS (
+  -- Calculate cumulative expired connections
+  SELECT
+    Date,
+    SUM(Expired) OVER (ORDER BY Date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS Cumulative_Expired
+  FROM
+    MonthlySummary
+),
+FinalSummary AS (
+  -- Combine cumulative active and expired values
+  SELECT
+    m.Date,
+    m.Active,
+    m.Expired,
+    ca.Cumulative_Active - COALESCE(ce.Cumulative_Expired, 0) AS Total_Active_Data_Connections
+  FROM
+    MonthlySummary m
+  LEFT JOIN CumulativeActive ca ON m.Date = ca.Date
+  LEFT JOIN CumulativeExpired ce ON m.Date = ce.Date
+)
+-- Final output
+SELECT
+  FORMAT_DATE('%b-%Y', Date) AS Month,
+  Active,
+  Expired,
+  Total_Active_Data_Connections
+FROM
+  FinalSummary
+WHERE
+  Date BETWEEN DATE('2023-01-01') AND CURRENT_DATE()
+ORDER BY
+  Date;
