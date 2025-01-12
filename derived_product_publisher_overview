@@ -178,3 +178,150 @@ LEFT JOIN
     Monthly_Approval_Counts mac ON DATE_TRUNC(ms.Active_Month, MONTH) = mac.Month
 ORDER BY 
     Month;
+
+
+
+
+----------------------------------------------------------------------------
+
+Has correct counts
+
+WITH Product_Details AS (
+    SELECT 
+        `Product Series Code`,
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
+        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
+        `Version Number`,
+        `State`
+    FROM 
+        `rdmga4.RDMreports.raw_data_product_details`
+    WHERE 
+        `State` IN ('active', 'expired')
+),
+
+Contract_Details AS (
+    SELECT 
+        `Product Series Code`,
+        SAFE_CAST(`Sunsetting Date` AS DATE) AS Sunsetting_Date,
+        CAST(`Seller BPID` AS STRING) AS Seller_BPID,
+        CAST(`Buyer BPID` AS STRING) AS Buyer_BPID
+    FROM 
+        `rdmga4.RDMreports.contracts`
+    WHERE 
+        -- Only include relevant contracts
+        SAFE_CAST(`Sunsetting Date` AS DATE) >= DATE('2023-01-01')
+        OR `Sunsetting Date` IS NULL
+),
+
+Organization_Details AS (
+    SELECT 
+        CAST(`BPID` AS STRING) AS BPID,
+        `Organization Name`,
+        SAFE_CAST(`Request approved at` AS DATE) AS Consumer_Approval_Date
+    FROM 
+        `rdmga4.RDMreports.raw_organization_overview`
+    WHERE 
+        `Request approved at` IS NOT NULL
+),
+
+Active_Products AS (
+    SELECT 
+        pd.`Product Series Code`,
+        pd.Data_Product_Name,
+        pd.Published_Date,
+        cd.Sunsetting_Date,
+        pub_org.`Organization Name` AS Publisher_Organization_Name,
+        cons_org.`Organization Name` AS Consumer_Organization_Name,
+        pd.State,
+        -- Check if product is active for current viewing date
+        CASE
+            WHEN pd.State = 'expired' AND cd.Sunsetting_Date <= CURRENT_DATE() THEN FALSE
+            WHEN pd.Published_Date > CURRENT_DATE() THEN FALSE
+            WHEN pd.State = 'active' OR cd.Sunsetting_Date > CURRENT_DATE() THEN TRUE
+            ELSE FALSE
+        END AS Is_Active_Today,
+        -- Get exact activation and expiration dates
+        GREATEST(pd.Published_Date, DATE('2023-01-01')) AS Activation_Date,
+        cd.Sunsetting_Date AS Expiration_Date
+    FROM 
+        Product_Details pd
+    LEFT JOIN 
+        Contract_Details cd ON pd.`Product Series Code` = cd.`Product Series Code`
+    LEFT JOIN 
+        Organization_Details pub_org ON cd.Seller_BPID = pub_org.BPID
+    LEFT JOIN 
+        Organization_Details cons_org ON cd.Buyer_BPID = cons_org.BPID
+    WHERE 
+        pd.Published_Date <= CURRENT_DATE()
+),
+
+Date_Spine AS (
+    SELECT date
+    FROM UNNEST(GENERATE_DATE_ARRAY(
+        DATE('2023-01-01'),
+        CURRENT_DATE(),
+        INTERVAL 1 DAY
+    )) AS date
+),
+
+Daily_Product_Status AS (
+    SELECT
+        ds.date AS Status_Date,
+        ap.`Product Series Code`,
+        ap.Publisher_Organization_Name,
+        ap.Consumer_Organization_Name,
+        -- Check if product is active on specific date
+        CASE
+            WHEN ap.Activation_Date <= ds.date 
+                 AND (ap.Expiration_Date IS NULL OR ap.Expiration_Date > ds.date)
+                 AND (ap.State = 'active' OR ds.date < ap.Expiration_Date)
+            THEN TRUE
+            ELSE FALSE
+        END AS Is_Active_On_Date
+    FROM 
+        Date_Spine ds
+    CROSS JOIN 
+        Active_Products ap
+),
+
+Daily_Counts AS (
+    SELECT 
+        Status_Date,
+        COUNT(DISTINCT CASE WHEN Is_Active_On_Date THEN Publisher_Organization_Name END) AS Distinct_Publisher_Count,
+        COUNT(DISTINCT CASE WHEN Is_Active_On_Date THEN Consumer_Organization_Name END) AS Distinct_Consumer_Count,
+        COUNT(DISTINCT CASE WHEN Is_Active_On_Date THEN `Product Series Code` END) AS Products_Active_Count
+    FROM 
+        Daily_Product_Status
+    GROUP BY 
+        Status_Date
+),
+
+Approval_Status AS (
+    SELECT 
+        ds.date AS Status_Date,
+        COUNT(DISTINCT CASE WHEN od.Consumer_Approval_Date <= ds.date THEN od.BPID END) AS Approved_Consumers,
+        COUNT(DISTINCT CASE WHEN ctp.`Upgrade request approval date` <= ds.date THEN ctp.BPID END) AS Approved_Publishers
+    FROM 
+        Date_Spine ds
+    CROSS JOIN Organization_Details od
+    LEFT JOIN `rdmga4.RDMreports.consumer_to_publisher` ctp 
+        ON ctp.`Upgrade request approval date` IS NOT NULL
+    GROUP BY 
+        ds.date
+)
+
+SELECT 
+    dc.Status_Date,
+    dc.Distinct_Publisher_Count,
+    dc.Distinct_Consumer_Count,
+    dc.Products_Active_Count,
+    COALESCE(aps.Approved_Consumers, 0) AS Approved_Consumers,
+    dc.Distinct_Publisher_Count AS Publishers_In_Contracts,
+    COALESCE(aps.Approved_Publishers, 0) AS Approved_Publishers,
+    dc.Products_Active_Count AS Unique_Products
+FROM 
+    Daily_Counts dc
+LEFT JOIN 
+    Approval_Status aps ON dc.Status_Date = aps.Status_Date
+ORDER BY 
+    Status_Date;
