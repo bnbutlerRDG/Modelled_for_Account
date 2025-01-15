@@ -191,3 +191,132 @@ Combined_Data AS (
 SELECT *
 FROM Combined_Data
 ORDER BY Join_Date, Type, Name;
+
+
+
+------------------
+This is a bit better might not be perfect
+
+WITH Product_Details AS (
+    SELECT 
+        CAST(`Product Series Code` AS STRING) AS Product_Series_Code,
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
+        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
+        SAFE_CAST(`Version Number` AS FLOAT64) AS Version_Number,
+        `License Type`,
+        `State`
+    FROM 
+        `rdmga4.RDMreports.raw_data_product_details`
+    WHERE 
+        `State` = 'active'
+),
+
+Latest_Version AS (
+    SELECT 
+        CAST(`Product Series Code` AS STRING) AS Product_Series_Code,
+        MAX(SAFE_CAST(`Version Number` AS FLOAT64)) AS Max_Version
+    FROM 
+        `rdmga4.RDMreports.raw_data_product_details`
+    GROUP BY 
+        Product_Series_Code
+),
+
+Filtered_Products AS (
+    SELECT 
+        pd.Product_Series_Code,
+        pd.Data_Product_Name,
+        pd.Published_Date,
+        pd.Version_Number,
+        pd.`License Type`
+    FROM 
+        Product_Details pd
+    JOIN 
+        Latest_Version lv
+    ON 
+        pd.Product_Series_Code = lv.Product_Series_Code
+        AND pd.Version_Number = lv.Max_Version
+),
+
+Consumer_Details AS (
+    SELECT 
+        DISTINCT cons.`Organization Name` AS Consumer_Name,
+        CAST(cons.`BPID` AS STRING) AS Consumer_BPID,
+        SAFE_CAST(cons.`Request approved at` AS DATE) AS Consumer_Join_Date
+    FROM 
+        `rdmga4.RDMreports.raw_organization_overview` cons
+    WHERE 
+        cons.`Request approved at` IS NOT NULL
+),
+
+Publisher_Details AS (
+    SELECT 
+        DISTINCT pub.`Organization Name` AS Publisher_Name,
+        CAST(pub.`BPID` AS STRING) AS Publisher_BPID,
+        SAFE_CAST(pub.`Upgrade request approval date` AS DATE) AS Publisher_Join_Date
+    FROM 
+        `rdmga4.RDMreports.consumer_to_publisher` pub
+    WHERE 
+        pub.`Upgrade request approval date` IS NOT NULL
+),
+
+Product_Consumer_Link AS (
+    SELECT 
+        fp.Product_Series_Code,
+        fp.Data_Product_Name,
+        cd.Consumer_Name,
+        MIN(contracts.`Contract Start Date`) AS Interaction_Date -- Aggregate by earliest interaction date
+    FROM 
+        Filtered_Products fp
+    JOIN 
+        `rdmga4.RDMreports.contracts` contracts
+    ON 
+        fp.Product_Series_Code = CAST(contracts.`Product Series Code` AS STRING)
+    JOIN 
+        Consumer_Details cd
+    ON 
+        contracts.`Buyer BPID` = cd.Consumer_BPID
+    GROUP BY 
+        fp.Product_Series_Code, fp.Data_Product_Name, cd.Consumer_Name
+),
+
+Product_Publisher_Link AS (
+    SELECT 
+        fp.Product_Series_Code,
+        fp.Data_Product_Name,
+        pub.Publisher_Name
+    FROM 
+        Filtered_Products fp
+    JOIN 
+        `rdmga4.RDMreports.contracts` contracts
+    ON 
+        fp.Product_Series_Code = CAST(contracts.`Product Series Code` AS STRING)
+    JOIN 
+        Publisher_Details pub
+    ON 
+        contracts.`Seller BPID` = pub.Publisher_BPID
+),
+
+Combined_Data AS (
+    SELECT 
+        fp.Data_Product_Name AS Name,
+        fp.Published_Date AS Join_Date,
+        fp.Version_Number AS Version,
+        fp.`License Type` AS License_Type,
+        pc.Consumer_Name AS Linked_Consumer,
+        pp.Publisher_Name AS Linked_Publisher,
+        pc.Interaction_Date
+    FROM 
+        Filtered_Products fp
+    LEFT JOIN 
+        Product_Consumer_Link pc
+    ON 
+        fp.Product_Series_Code = pc.Product_Series_Code
+    LEFT JOIN 
+        Product_Publisher_Link pp
+    ON 
+        fp.Product_Series_Code = pp.Product_Series_Code
+)
+
+SELECT DISTINCT * 
+FROM Combined_Data
+ORDER BY Join_Date, Name;
