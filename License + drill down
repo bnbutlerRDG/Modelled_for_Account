@@ -241,3 +241,118 @@ FROM Final
 WHERE final_rn = 1
 ORDER BY Product_Series_Code, Consumer_Organization_Name;
 
+
+
+
+------------------------------------------------------
+Even better
+
+WITH Product_Details AS (
+    -- Get all product details without state filtering
+    SELECT DISTINCT
+        `Product Series Code` AS Product_Series_Code,
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
+        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
+        `License Type` AS License_Type,
+        State
+    FROM `rdmga4.RDMreports.raw_data_product_details`
+),
+
+Publisher_Details AS (
+    -- Get all publisher organizations
+    SELECT DISTINCT
+        CAST(`BPID` AS STRING) AS BPID,
+        `Organization Name` AS Publisher_Organization_Name,
+        SAFE_CAST(`Request approved at` AS DATE) AS Publisher_Registration_Date
+    FROM `rdmga4.RDMreports.raw_organization_overview`
+),
+
+Consumer_Details AS (
+    -- Get all consumer organizations
+    SELECT DISTINCT
+        CAST(`BPID` AS STRING) AS BPID,
+        `Organization Name` AS Consumer_Organization_Name,
+        SAFE_CAST(`Request approved at` AS DATE) AS Consumer_Registration_Date
+    FROM `rdmga4.RDMreports.raw_organization_overview`
+),
+
+Contract_Details AS (
+    -- Get contract details while preserving all versions
+    SELECT
+        CAST(`Buyer BPID` AS STRING) AS Buyer_BPID,
+        CAST(`Seller BPID` AS STRING) AS Seller_BPID,
+        `Product Series Code` AS Product_Series_Code,
+        `Contract Series Code` AS Contract_Series_Code,
+        SAFE_CAST(`Contract Start Date` AS DATE) AS Contract_Start_Date,
+        SAFE_CAST(`Contract Expiry Date` AS DATE) AS Contract_End_Date,
+        `Version Number` AS Version_Number
+    FROM `rdmga4.RDMreports.contracts`
+    WHERE `Product Series Code` IS NOT NULL
+),
+
+API_Call_Summary AS (
+    -- Summarize API calls by contract
+    SELECT
+        CAST(dc.`Contract Code` AS STRING) AS Contract_Code,
+        SUM(dc.`Total number of Hits`) AS Total_API_Calls
+    FROM `rdmga4.RDMreports.daily_consumption` dc
+    GROUP BY Contract_Code
+),
+
+Combined_Data AS (
+    -- Start with products and join everything else
+    SELECT
+        pd.Product_Series_Code,
+        pd.Data_Product_Name,
+        pd.License_Type,
+        pd.Published_Date,
+        pd.State,
+        cd.Contract_Series_Code,
+        cd.Contract_Start_Date,
+        cd.Contract_End_Date,
+        pub.Publisher_Organization_Name,
+        pub.Publisher_Registration_Date,
+        cons.Consumer_Organization_Name,
+        cons.Consumer_Registration_Date,
+        COALESCE(api.Total_API_Calls, 0) AS Total_API_Calls,
+        ROW_NUMBER() OVER (
+            PARTITION BY 
+                pd.Product_Series_Code, 
+                cd.Buyer_BPID,
+                cd.Seller_BPID
+            ORDER BY 
+                cd.Contract_Start_Date DESC,
+                cd.Version_Number DESC
+        ) AS rn
+    FROM Product_Details pd
+    LEFT JOIN Contract_Details cd
+        ON pd.Product_Series_Code = cd.Product_Series_Code
+    LEFT JOIN Publisher_Details pub
+        ON cd.Seller_BPID = pub.BPID
+    LEFT JOIN Consumer_Details cons
+        ON cd.Buyer_BPID = cons.BPID
+    LEFT JOIN API_Call_Summary api
+        ON cd.Contract_Series_Code = api.Contract_Code
+)
+
+-- Final Output
+SELECT
+    Product_Series_Code,
+    Data_Product_Name,
+    License_Type,
+    Published_Date AS Product_Published_Date,
+    State,
+    Contract_Series_Code,
+    Total_API_Calls,
+    Consumer_Organization_Name,
+    Consumer_Registration_Date,
+    Publisher_Organization_Name,
+    Publisher_Registration_Date,
+    Contract_Start_Date,
+    Contract_End_Date
+FROM Combined_Data
+WHERE rn = 1 OR rn IS NULL  -- Keep products without contracts
+ORDER BY 
+    Product_Series_Code,
+    Consumer_Organization_Name
+
