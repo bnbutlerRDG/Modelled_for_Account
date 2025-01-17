@@ -112,3 +112,132 @@ WHERE final_rn = 1
 ORDER BY
   Product_Series_Code,
   Consumer_Organization_Name;
+
+
+
+
+
+------------------------------------
+
+
+This is the better option
+
+
+WITH Deduplicated_Contracts AS (
+  -- Deduplicate contracts by Buyer and Product Series
+  SELECT
+    CAST(`Buyer BPID` AS STRING)  AS Buyer_BPID,
+    CAST(`Seller BPID` AS STRING) AS Seller_BPID,
+    `Product Series Code`         AS Product_Series_Code,
+    `Contract Series Code`        AS Contract_Series_Code,
+    SAFE_CAST(`Contract Start Date` AS DATE)  AS Contract_Start_Date,
+    SAFE_CAST(`Contract Expiry Date` AS DATE) AS Contract_End_Date,
+    `Version Number`              AS Version_Number,
+
+    ROW_NUMBER() OVER (
+      PARTITION BY `Buyer BPID`, `Product Series Code`, `Seller BPID`, `Contract Series Code`
+      ORDER BY 
+        SAFE_CAST(`Contract Start Date` AS DATE) ASC,
+        `Version Number` ASC
+    ) AS rn
+  FROM `rdmga4.RDMreports.contracts`
+  WHERE
+    `Product Series Code` IS NOT NULL
+    AND `Contract Start Date` IS NOT NULL
+    AND `Contract Expiry Date` IS NOT NULL
+),
+Filtered_Contracts AS (
+  -- Retain only the first row per Buyer + Product Series
+  SELECT *
+  FROM Deduplicated_Contracts
+  WHERE rn = 1
+),
+Unique_Product_Details AS (
+  -- Include all products, even without engagement
+  SELECT DISTINCT
+    `Product Series Code` AS Product_Series_Code,
+    COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
+    SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
+    `License Type` AS License_Type,
+    State
+  FROM `rdmga4.RDMreports.raw_data_product_details`
+),
+Unique_Organization_Details AS (
+  -- Include all organizations, even without engagement
+  SELECT DISTINCT
+    CAST(`BPID` AS STRING) AS BPID,
+    `Organization Name` AS Org_Name,
+    SAFE_CAST(`Request approved at` AS DATE) AS Registration_Date
+  FROM `rdmga4.RDMreports.raw_organization_overview`
+),
+API_Call_Summary AS (
+  -- Summarize API calls (No of Hits) by contract and month
+  SELECT
+    CAST(dc.`Contract Code` AS STRING) AS Contract_Code,
+    SUM(dc.`Total number of Hits`) AS Total_API_Calls
+  FROM `rdmga4.RDMreports.daily_consumption` dc
+  GROUP BY Contract_Code
+),
+Combined_Records AS (
+  -- Combine filtered contracts, products, and organization details
+  SELECT
+    fc.Buyer_BPID,
+    fc.Seller_BPID,
+    fc.Product_Series_Code,
+    fc.Contract_Series_Code,
+    fc.Contract_Start_Date,
+    fc.Contract_End_Date,
+    fc.Version_Number,
+
+    pd.Data_Product_Name,
+    pd.License_Type,
+    pd.Published_Date,
+    pd.State,
+
+    pub.Org_Name          AS Publisher_Organization_Name,
+    pub.Registration_Date AS Publisher_Registration_Date,
+
+    cons.Org_Name         AS Consumer_Organization_Name,
+    cons.Registration_Date AS Consumer_Registration_Date,
+
+    api.Total_API_Calls -- Aggregated API calls per contract
+  FROM Filtered_Contracts fc
+  FULL OUTER JOIN Unique_Product_Details pd
+         ON fc.Product_Series_Code = pd.Product_Series_Code
+  FULL OUTER JOIN Unique_Organization_Details pub
+         ON fc.Seller_BPID = pub.BPID
+  FULL OUTER JOIN Unique_Organization_Details cons
+         ON fc.Buyer_BPID = cons.BPID
+  LEFT JOIN API_Call_Summary api
+         ON fc.Contract_Series_Code = api.Contract_Code
+),
+Final AS (
+  -- Ensure deduplication by key dimensions
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY Product_Series_Code, Consumer_Organization_Name, Publisher_Organization_Name
+      ORDER BY Contract_Start_Date ASC, Version_Number ASC
+    ) AS final_rn
+  FROM Combined_Records
+)
+
+-- Final Output
+SELECT
+  Product_Series_Code,
+  Contract_Series_Code,
+  Data_Product_Name,
+  License_Type,
+  Published_Date       AS Product_Published_Date,
+  State,
+  Total_API_Calls, -- Aggregated API calls
+  Consumer_Organization_Name,
+  Consumer_Registration_Date,
+  Publisher_Organization_Name,
+  Publisher_Registration_Date,
+  Contract_Start_Date,
+  Contract_End_Date
+FROM Final
+WHERE final_rn = 1
+ORDER BY Product_Series_Code, Consumer_Organization_Name;
+
