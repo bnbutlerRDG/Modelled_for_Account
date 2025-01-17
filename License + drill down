@@ -1,322 +1,114 @@
--- Correct Combined Dataset for Tableau License + drill down for 1,2,3 + KPI  5
-WITH Product_Details AS (
-    SELECT 
-        `Product Series Code`,
-        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
-        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
-        `Version Number`,
-        `License Type`,
-        `State`
-    FROM 
-        `rdmga4.RDMreports.raw_data_product_details`
-    WHERE 
-        `State` = 'active' -- Only active products
+WITH Deduplicated_Contracts AS (
+  SELECT
+    CAST(`Buyer BPID` AS STRING)  AS Buyer_BPID,
+    CAST(`Seller BPID` AS STRING) AS Seller_BPID,
+    `Product Series Code`         AS Product_Series_Code,
+    `Contract Series Code`        AS Contract_Series_Code,
+    SAFE_CAST(`Contract Start Date` AS DATE)  AS Contract_Start_Date,
+    SAFE_CAST(`Contract Expiry Date` AS DATE) AS Contract_End_Date,
+    `Version Number`              AS Version_Number,
+
+    ROW_NUMBER() OVER (
+      PARTITION BY `Buyer BPID`, `Product Series Code`, `Seller BPID`, `Contract Series Code`
+      ORDER BY 
+        SAFE_CAST(`Contract Start Date` AS DATE) ASC,
+        `Version Number` ASC
+    ) AS rn
+  FROM `rdmga4.RDMreports.contracts`
+  WHERE
+    `Product Series Code`   IS NOT NULL
+    AND `Contract Start Date`  IS NOT NULL
+    AND `Contract Expiry Date` IS NOT NULL
+),
+Filtered_Contracts AS (
+  SELECT *
+  FROM Deduplicated_Contracts
+  WHERE rn = 1
 ),
 
-Latest_Version AS (
-    SELECT 
-        `Product Series Code`,
-        MAX(SAFE_CAST(`Version Number` AS FLOAT64)) AS Max_Version
-    FROM 
-        `rdmga4.RDMreports.raw_data_product_details`
-    GROUP BY 
-        `Product Series Code`
+Unique_Product_Details AS (
+  -- Possibly deduplicate if your product table has duplicates
+  SELECT
+    `Product Series Code` AS Product_Series_Code,
+    COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
+    SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
+    `License Type` AS License_Type,
+    State
+  FROM `rdmga4.RDMreports.raw_data_product_details`
+  WHERE State IN ('active', 'expired')
 ),
 
-Filtered_Products AS (
-    SELECT 
-        pd.`Product Series Code`,
-        pd.Data_Product_Name,
-        pd.Published_Date,
-        pd.`Version Number`,
-        pd.`License Type`
-    FROM 
-        Product_Details pd
-    JOIN 
-        Latest_Version lv
-    ON 
-        pd.`Product Series Code` = lv.`Product Series Code`
-        AND SAFE_CAST(pd.`Version Number` AS FLOAT64) = lv.Max_Version
+Unique_Organization_Details AS (
+  -- Possibly deduplicate if your org table has duplicates per BPID
+  SELECT
+    CAST(`BPID` AS STRING) AS BPID,
+    `Organization Name` AS Org_Name,
+    SAFE_CAST(`Request approved at` AS DATE) AS Registration_Date,
+    -- row_number() over(...) if needed
+  FROM `rdmga4.RDMreports.raw_organization_overview`
 ),
 
-Consumer_Details AS (
-    SELECT 
-        DISTINCT cons.`Organization Name` AS Consumer_Name,
-        SAFE_CAST(cons.`Request approved at` AS DATE) AS Consumer_Join_Date
-    FROM 
-        `rdmga4.RDMreports.raw_organization_overview` cons
-    WHERE 
-        cons.`Request approved at` IS NOT NULL
+Joined_Records AS (
+  SELECT
+    fc.Buyer_BPID,
+    fc.Seller_BPID,
+    fc.Product_Series_Code,
+    fc.Contract_Series_Code,
+    fc.Contract_Start_Date,
+    fc.Contract_End_Date,
+    fc.Version_Number,
+
+    pd.Data_Product_Name,
+    pd.License_Type,
+    pd.Published_Date,
+    pd.State,
+
+    pub_org.Org_Name          AS Publisher_Organization_Name,
+    pub_org.Registration_Date AS Publisher_Registration_Date,
+
+    cons_org.Org_Name         AS Consumer_Organization_Name,
+    cons_org.Registration_Date AS Consumer_Registration_Date
+  FROM Filtered_Contracts fc
+  LEFT JOIN Unique_Product_Details pd
+         ON fc.Product_Series_Code = pd.Product_Series_Code
+  LEFT JOIN Unique_Organization_Details pub_org
+         ON fc.Seller_BPID = pub_org.BPID
+  LEFT JOIN Unique_Organization_Details cons_org
+         ON fc.Buyer_BPID  = cons_org.BPID
 ),
 
-Publisher_Details AS (
-    SELECT 
-        DISTINCT pub.`Organization Name` AS Publisher_Name,
-        SAFE_CAST(pub.`Upgrade request approval date` AS DATE) AS Publisher_Join_Date
-    FROM 
-        `rdmga4.RDMreports.consumer_to_publisher` pub
-    WHERE 
-        pub.`Upgrade request approval date` IS NOT NULL
-),
-
-Combined_Data AS (
-    SELECT 
-        Data_Product_Name AS Name,
-        Published_Date AS Join_Date,
-        `Version Number` AS Version,
-        `License Type` AS License_Type,
-        'Product' AS Type
-    FROM 
-        Filtered_Products
-
-    UNION ALL
-
-    SELECT 
-        Consumer_Name AS Name,
-        Consumer_Join_Date AS Join_Date,
-        NULL AS Version,
-        NULL AS License_Type,
-        'Consumer' AS Type
-    FROM 
-        Consumer_Details
-
-    UNION ALL
-
-    SELECT 
-        Publisher_Name AS Name,
-        Publisher_Join_Date AS Join_Date,
-        NULL AS Version,
-        NULL AS License_Type,
-        'Publisher' AS Type
-    FROM 
-        Publisher_Details
+-- Final deduplicate step
+Final AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY 
+        Buyer_BPID, 
+        Product_Series_Code, 
+        Seller_BPID, 
+        Contract_Series_Code
+      ORDER BY Contract_Start_Date ASC, Version_Number ASC
+    ) AS final_rn
+  FROM Joined_Records
 )
 
-SELECT *
-FROM Combined_Data
-ORDER BY Join_Date, Type, Name;-- Correct Combined Dataset for Tableau License + drill down for 1,2,3 + KPI  5
-WITH Product_Details AS (
-    SELECT 
-        `Product Series Code`,
-        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
-        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
-        `Version Number`,
-        `License Type`,
-        `State`
-    FROM 
-        `rdmga4.RDMreports.raw_data_product_details`
-    WHERE 
-        `State` = 'active' -- Only active products
-),
+SELECT
+  Product_Series_Code,
+  Contract_Series_Code,
+  Data_Product_Name,
+  License_Type,
+  Published_Date       AS Product_Published_Date,
+  Version_Number,
 
-Latest_Version AS (
-    SELECT 
-        `Product Series Code`,
-        MAX(SAFE_CAST(`Version Number` AS FLOAT64)) AS Max_Version
-    FROM 
-        `rdmga4.RDMreports.raw_data_product_details`
-    GROUP BY 
-        `Product Series Code`
-),
+  Publisher_Organization_Name,
+  Publisher_Registration_Date,
+  Consumer_Organization_Name,
+  Consumer_Registration_Date,
 
-Filtered_Products AS (
-    SELECT 
-        pd.`Product Series Code`,
-        pd.Data_Product_Name,
-        pd.Published_Date,
-        pd.`Version Number`,
-        pd.`License Type`
-    FROM 
-        Product_Details pd
-    JOIN 
-        Latest_Version lv
-    ON 
-        pd.`Product Series Code` = lv.`Product Series Code`
-        AND SAFE_CAST(pd.`Version Number` AS FLOAT64) = lv.Max_Version
-),
-
-Consumer_Details AS (
-    SELECT 
-        DISTINCT cons.`Organization Name` AS Consumer_Name,
-        SAFE_CAST(cons.`Request approved at` AS DATE) AS Consumer_Join_Date
-    FROM 
-        `rdmga4.RDMreports.raw_organization_overview` cons
-    WHERE 
-        cons.`Request approved at` IS NOT NULL
-),
-
-Publisher_Details AS (
-    SELECT 
-        DISTINCT pub.`Organization Name` AS Publisher_Name,
-        SAFE_CAST(pub.`Upgrade request approval date` AS DATE) AS Publisher_Join_Date
-    FROM 
-        `rdmga4.RDMreports.consumer_to_publisher` pub
-    WHERE 
-        pub.`Upgrade request approval date` IS NOT NULL
-),
-
-Combined_Data AS (
-    SELECT 
-        Data_Product_Name AS Name,
-        Published_Date AS Join_Date,
-        `Version Number` AS Version,
-        `License Type` AS License_Type,
-        'Product' AS Type
-    FROM 
-        Filtered_Products
-
-    UNION ALL
-
-    SELECT 
-        Consumer_Name AS Name,
-        Consumer_Join_Date AS Join_Date,
-        NULL AS Version,
-        NULL AS License_Type,
-        'Consumer' AS Type
-    FROM 
-        Consumer_Details
-
-    UNION ALL
-
-    SELECT 
-        Publisher_Name AS Name,
-        Publisher_Join_Date AS Join_Date,
-        NULL AS Version,
-        NULL AS License_Type,
-        'Publisher' AS Type
-    FROM 
-        Publisher_Details
-)
-
-SELECT *
-FROM Combined_Data
-ORDER BY Join_Date, Type, Name;
-
-
-
-------------------
-This is a bit better might not be perfect
-
-WITH Product_Details AS (
-    SELECT 
-        CAST(`Product Series Code` AS STRING) AS Product_Series_Code,
-        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
-        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
-        SAFE_CAST(`Version Number` AS FLOAT64) AS Version_Number,
-        `License Type`,
-        `State`
-    FROM 
-        `rdmga4.RDMreports.raw_data_product_details`
-    WHERE 
-        `State` = 'active'
-),
-
-Latest_Version AS (
-    SELECT 
-        CAST(`Product Series Code` AS STRING) AS Product_Series_Code,
-        MAX(SAFE_CAST(`Version Number` AS FLOAT64)) AS Max_Version
-    FROM 
-        `rdmga4.RDMreports.raw_data_product_details`
-    GROUP BY 
-        Product_Series_Code
-),
-
-Filtered_Products AS (
-    SELECT 
-        pd.Product_Series_Code,
-        pd.Data_Product_Name,
-        pd.Published_Date,
-        pd.Version_Number,
-        pd.`License Type`
-    FROM 
-        Product_Details pd
-    JOIN 
-        Latest_Version lv
-    ON 
-        pd.Product_Series_Code = lv.Product_Series_Code
-        AND pd.Version_Number = lv.Max_Version
-),
-
-Consumer_Details AS (
-    SELECT 
-        DISTINCT cons.`Organization Name` AS Consumer_Name,
-        CAST(cons.`BPID` AS STRING) AS Consumer_BPID,
-        SAFE_CAST(cons.`Request approved at` AS DATE) AS Consumer_Join_Date
-    FROM 
-        `rdmga4.RDMreports.raw_organization_overview` cons
-    WHERE 
-        cons.`Request approved at` IS NOT NULL
-),
-
-Publisher_Details AS (
-    SELECT 
-        DISTINCT pub.`Organization Name` AS Publisher_Name,
-        CAST(pub.`BPID` AS STRING) AS Publisher_BPID,
-        SAFE_CAST(pub.`Upgrade request approval date` AS DATE) AS Publisher_Join_Date
-    FROM 
-        `rdmga4.RDMreports.consumer_to_publisher` pub
-    WHERE 
-        pub.`Upgrade request approval date` IS NOT NULL
-),
-
-Product_Consumer_Link AS (
-    SELECT 
-        fp.Product_Series_Code,
-        fp.Data_Product_Name,
-        cd.Consumer_Name,
-        MIN(contracts.`Contract Start Date`) AS Interaction_Date -- Aggregate by earliest interaction date
-    FROM 
-        Filtered_Products fp
-    JOIN 
-        `rdmga4.RDMreports.contracts` contracts
-    ON 
-        fp.Product_Series_Code = CAST(contracts.`Product Series Code` AS STRING)
-    JOIN 
-        Consumer_Details cd
-    ON 
-        contracts.`Buyer BPID` = cd.Consumer_BPID
-    GROUP BY 
-        fp.Product_Series_Code, fp.Data_Product_Name, cd.Consumer_Name
-),
-
-Product_Publisher_Link AS (
-    SELECT 
-        fp.Product_Series_Code,
-        fp.Data_Product_Name,
-        pub.Publisher_Name
-    FROM 
-        Filtered_Products fp
-    JOIN 
-        `rdmga4.RDMreports.contracts` contracts
-    ON 
-        fp.Product_Series_Code = CAST(contracts.`Product Series Code` AS STRING)
-    JOIN 
-        Publisher_Details pub
-    ON 
-        contracts.`Seller BPID` = pub.Publisher_BPID
-),
-
-Combined_Data AS (
-    SELECT 
-        fp.Data_Product_Name AS Name,
-        fp.Published_Date AS Join_Date,
-        fp.Version_Number AS Version,
-        fp.`License Type` AS License_Type,
-        pc.Consumer_Name AS Linked_Consumer,
-        pp.Publisher_Name AS Linked_Publisher,
-        pc.Interaction_Date
-    FROM 
-        Filtered_Products fp
-    LEFT JOIN 
-        Product_Consumer_Link pc
-    ON 
-        fp.Product_Series_Code = pc.Product_Series_Code
-    LEFT JOIN 
-        Product_Publisher_Link pp
-    ON 
-        fp.Product_Series_Code = pp.Product_Series_Code
-)
-
-SELECT DISTINCT * 
-FROM Combined_Data
-ORDER BY Join_Date, Name;
+  Contract_Start_Date,
+  Contract_End_Date
+FROM Final
+WHERE final_rn = 1
+ORDER BY
+  Product_Series_Code,
+  Consumer_Organization_Name;
