@@ -97,3 +97,53 @@ WHERE
   Date BETWEEN DATE('2023-01-01') AND CURRENT_DATE()
 ORDER BY
   Date;
+
+
+-----
+Works to get numbers by type
+
+WITH DeduplicatedContracts AS (
+  SELECT
+    c.`Buyer BPID`,
+    c.`Contract Series Code`,
+    c.`Contract Start Date`,
+    c.`Contract Expiry Date`,
+    o.org_category_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY c.`Buyer BPID`, c.`Contract Series Code`
+      ORDER BY c.`Contract Start Date` ASC
+    ) AS RowNum
+  FROM
+    rdmga4.RDMreports.contracts c
+    LEFT JOIN rdmga4.RDMreports.org_type_file o
+    ON CAST(c.`Buyer BPID` AS STRING) = CAST(o.organization_bpid AS STRING)
+  WHERE
+    c.`Contract Start Date` IS NOT NULL 
+    AND c.`Contract Expiry Date` IS NOT NULL
+),
+NetConnections AS (
+  SELECT
+    org_category_name,
+    COUNT(DISTINCT CASE WHEN RowNum = 1 THEN CONCAT(`Buyer BPID`, '-', `Contract Series Code`) END) AS Total_New_Contracts,
+    COUNT(DISTINCT CASE WHEN RowNum = 1 AND `Contract Expiry Date` <= CURRENT_DATE() THEN CONCAT(`Buyer BPID`, '-', `Contract Series Code`) END) AS Total_Expired_Contracts
+  FROM
+    DeduplicatedContracts
+  WHERE
+    org_category_name IS NOT NULL
+  GROUP BY
+    org_category_name
+),
+FinalSummary AS (
+  SELECT
+    org_category_name,
+    Total_New_Contracts - Total_Expired_Contracts AS Total_Active_Connections
+  FROM
+    NetConnections
+)
+SELECT
+  org_category_name,
+  Total_Active_Connections
+FROM
+  FinalSummary
+ORDER BY
+  org_category_name;
