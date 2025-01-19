@@ -147,3 +147,182 @@ FROM
   FinalSummary
 ORDER BY
   org_category_name;
+
+
+---------------------------
+
+Full query
+
+-- 1) Distinct categories
+WITH Categories AS (
+  SELECT DISTINCT 
+    org_category_name
+  FROM 
+    rdmga4.RDMreports.org_type_file
+  WHERE
+    org_category_name IS NOT NULL
+),
+
+-- 2) Generate all months from 2023-01-01 up to today
+Months AS (
+  SELECT 
+    DATE_TRUNC(
+      DATE_ADD(DATE('2023-01-01'), INTERVAL n MONTH),
+      MONTH
+    ) AS Month_Start
+  FROM UNNEST(
+    GENERATE_ARRAY(
+      0,
+      DATE_DIFF(CURRENT_DATE(), DATE('2023-01-01'), MONTH)
+    )
+  ) AS n
+),
+
+-- 3) Create all (month, category) pairs
+AllMonthCategories AS (
+  SELECT
+    m.Month_Start AS Date,
+    c.org_category_name
+  FROM
+    Months m
+    CROSS JOIN Categories c
+),
+
+-- 4) Deduplicate contracts
+DeduplicatedContracts AS (
+  SELECT
+    c.`Buyer BPID`,
+    c.`Contract Series Code`,
+    c.`Contract Start Date`,
+    c.`Contract Expiry Date`,
+    o.org_category_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY c.`Buyer BPID`, c.`Contract Series Code`
+      ORDER BY c.`Contract Start Date` ASC
+    ) AS RowNum
+  FROM
+    rdmga4.RDMreports.contracts AS c
+  LEFT JOIN
+    rdmga4.RDMreports.org_type_file AS o
+    ON CAST(c.`Buyer BPID` AS STRING) = CAST(o.organization_bpid AS STRING)
+  WHERE
+    c.`Contract Start Date` IS NOT NULL
+    AND c.`Contract Expiry Date` IS NOT NULL
+),
+
+-- 5) Identify active connections per (month, category)
+ActiveConnections AS (
+  SELECT
+    DATE_TRUNC(`Contract Start Date`, MONTH) AS Active_Month,
+    org_category_name,
+    COUNT(
+      DISTINCT CONCAT(`Buyer BPID`, '-', `Contract Series Code`)
+    ) AS Active_Count
+  FROM
+    DeduplicatedContracts
+  WHERE
+    RowNum = 1
+  GROUP BY
+    Active_Month,
+    org_category_name
+),
+
+-- 6) Identify expired connections per (month, category)
+ExpiredConnections AS (
+  SELECT
+    DATE_TRUNC(DATE_ADD(`Contract Expiry Date`, INTERVAL 1 MONTH), MONTH) AS Expired_Month,
+    org_category_name,
+    COUNT(
+      DISTINCT CONCAT(`Buyer BPID`, '-', `Contract Series Code`)
+    ) AS Expired_Count
+  FROM
+    DeduplicatedContracts
+  WHERE
+    RowNum = 1
+  GROUP BY
+    Expired_Month,
+    org_category_name
+),
+
+-- 7) Merge active and expired counts into a single monthly summary (for each category)
+MonthlySummary AS (
+  SELECT
+    amc.Date,
+    amc.org_category_name,
+    COALESCE(ac.Active_Count, 0) AS Active_in_month,
+    COALESCE(ec.Expired_Count, 0) AS Expired_in_month
+  FROM
+    AllMonthCategories AS amc
+    LEFT JOIN ActiveConnections ac
+      ON amc.Date = ac.Active_Month
+      AND amc.org_category_name = ac.org_category_name
+    LEFT JOIN ExpiredConnections ec
+      ON amc.Date = ec.Expired_Month
+      AND amc.org_category_name = ec.org_category_name
+),
+
+-- 8) Compute the cumulative net active connections by category
+CumulativeSummary AS (
+  SELECT
+    Date,
+    org_category_name,
+    SUM(Active_in_month) 
+      OVER (
+        PARTITION BY org_category_name 
+        ORDER BY Date 
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+    - 
+    SUM(Expired_in_month) 
+      OVER (
+        PARTITION BY org_category_name 
+        ORDER BY Date 
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) AS Total_Active_Data_Connections,
+    Active_in_month,
+    Expired_in_month
+  FROM
+    MonthlySummary
+),
+
+-- 9) Add a "Total" row by summing across all categories per month
+FinalSummary AS (
+  SELECT
+    Date,
+    org_category_name,
+    Active_in_month,
+    Expired_in_month,
+    Total_Active_Data_Connections
+  FROM
+    CumulativeSummary
+  
+  UNION ALL
+  
+  SELECT
+    Date,
+    "Total" AS org_category_name,
+    SUM(Active_in_month) AS Active_in_month,
+    SUM(Expired_in_month) AS Expired_in_month,
+    SUM(Total_Active_Data_Connections) AS Total_Active_Data_Connections
+  FROM
+    CumulativeSummary
+  GROUP BY
+    Date
+)
+
+-- 10) Final Select and output
+SELECT
+  FORMAT_DATE('%b-%Y', Date) AS Month,
+  org_category_name,
+  Active_in_month AS Active,
+  Expired_in_month AS Expired,
+  Total_Active_Data_Connections
+FROM
+  FinalSummary
+WHERE
+  Date BETWEEN DATE('2023-01-01') AND CURRENT_DATE()
+ORDER BY
+  Date,
+  -- This pushes the 'Total' category row below the other categories
+  CASE WHEN org_category_name = 'Total' THEN 1 ELSE 0 END,
+  org_category_name;
