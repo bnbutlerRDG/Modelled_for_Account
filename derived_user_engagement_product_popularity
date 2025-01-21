@@ -319,5 +319,182 @@ ORDER BY
   Metric_Type, duepp_month;
 
 
+----------------------------------------
+Best Version
+
+WITH MonthlyConsumption AS (
+  SELECT 
+    CAST(dc.`Contract Code` AS STRING) AS Contract_Code,
+    DATE_TRUNC(dc.`Metrics Collection Date`, MONTH) AS duepp_month,
+    SUM(dc.`Total Volume Consumed in Bytes`) AS duepp_total_volume, 
+    SUM(dc.`Total number of Hits`) AS duepp_api_hits
+  FROM 
+    `rdmga4.RDMreports.daily_consumption` dc
+  GROUP BY 
+    Contract_Code, duepp_month
+),
+DeduplicatedContracts AS (
+  -- Add deduplication at contract level
+  SELECT
+    `Contract Code`,
+    `Contract Start Date`,
+    `Contract Expiry Date`,
+    `Data Product Code`,
+    `Buyer BPID`,
+    ROW_NUMBER() OVER (
+      PARTITION BY `Buyer BPID`, `Contract Series Code`
+      ORDER BY `Contract Start Date` ASC
+    ) AS RowNum
+  FROM
+    `rdmga4.RDMreports.contracts`
+  WHERE
+    `Contract Start Date` IS NOT NULL
+),
+ContractDetails AS (
+  SELECT 
+    GENERATE_DATE_ARRAY(
+        DATE_TRUNC(c.`Contract Start Date`, MONTH), 
+        COALESCE(DATE_TRUNC(c.`Contract Expiry Date`, MONTH), DATE_TRUNC(CURRENT_DATE(), MONTH)), 
+        INTERVAL 1 MONTH
+    ) AS active_months,
+    CAST(c.`Contract Code` AS STRING) AS Contract_Code,
+    dpd.`Data Product Name` AS duepp_product_name,
+    CAST(c.`Buyer BPID` AS STRING) AS Buyer_BPID,
+    ro.`Organization Name` AS Buyer_Name
+  FROM 
+    DeduplicatedContracts c
+  LEFT JOIN 
+    `rdmga4.RDMreports.raw_data_product_details` dpd 
+    ON CAST(c.`Data Product Code` AS STRING) = CAST(dpd.`Data Product Code` AS STRING)
+  LEFT JOIN 
+    `rdmga4.RDMreports.raw_organization_overview` ro 
+    ON CAST(c.`Buyer BPID` AS STRING) = CAST(ro.`BPID` AS STRING)
+  WHERE
+    c.RowNum = 1  -- Only include deduplicated contracts
+),
+ExpandedContracts AS (
+  SELECT 
+    active_month AS duepp_month,
+    Contract_Code,
+    duepp_product_name,
+    Buyer_BPID,
+    Buyer_Name
+  FROM 
+    ContractDetails, UNNEST(active_months) AS active_month
+  WHERE 
+    active_month <= DATE_TRUNC(CURRENT_DATE(), MONTH) -- Filter out future months
+),
+MonthlyMetrics AS (
+  SELECT 
+    ec.duepp_month,
+    ec.duepp_product_name,
+    COUNT(DISTINCT ec.Buyer_BPID) AS user_count,
+    ARRAY_AGG(DISTINCT ec.Buyer_Name IGNORE NULLS) AS user_names
+  FROM 
+    ExpandedContracts ec
+  GROUP BY 
+    ec.duepp_month, ec.duepp_product_name
+),
+RankedProducts AS (
+  SELECT 
+    mm.duepp_month,
+    mm.duepp_product_name,
+    mm.user_count,
+    mm.user_names,
+    RANK() OVER (PARTITION BY mm.duepp_month ORDER BY mm.user_count DESC) AS rank
+  FROM 
+    MonthlyMetrics mm
+  WHERE 
+    mm.duepp_month <= DATE_TRUNC(CURRENT_DATE(), MONTH) -- Ensure no future months
+),
+Top10Products AS (
+  SELECT *
+  FROM RankedProducts
+  WHERE rank <= 10
+),
+RankedUsers AS (
+  SELECT 
+    ec.duepp_month,
+    ec.Buyer_Name AS duepp_organization_name,
+    SUM(mc.duepp_api_hits) AS total_api_hits,
+    SUM(mc.duepp_total_volume) AS total_volume,
+    RANK() OVER (PARTITION BY ec.duepp_month ORDER BY SUM(mc.duepp_api_hits) DESC) AS rank
+  FROM 
+    ExpandedContracts ec
+  LEFT JOIN MonthlyConsumption mc 
+    ON ec.Contract_Code = mc.Contract_Code AND ec.duepp_month = mc.duepp_month
+  WHERE 
+    ec.duepp_month <= DATE_TRUNC(CURRENT_DATE(), MONTH) -- Filter out future months
+  GROUP BY 
+    ec.duepp_month, ec.Buyer_Name
+),
+Top10Users AS (
+  SELECT *
+  FROM RankedUsers
+  WHERE rank <= 10
+),
+CumulativeAPICalls AS (
+  SELECT 
+    mc.duepp_month,
+    SUM(SUM(mc.duepp_api_hits)) OVER (ORDER BY mc.duepp_month) AS cumulative_api_calls
+  FROM 
+    MonthlyConsumption mc
+  WHERE 
+    mc.duepp_month <= DATE_TRUNC(CURRENT_DATE(), MONTH) -- Ensure no future months
+  GROUP BY 
+    mc.duepp_month
+),
+CombinedResults AS (
+  SELECT 
+    'Top10Products' AS Metric_Type,
+    t10p.duepp_month,
+    NULL AS Entity,
+    t10p.duepp_product_name AS Product_Name,
+    NULL AS Volume,
+    NULL AS API_Hits,
+    t10p.user_count AS User_Count,
+    t10p.user_names AS Subscriber_Names,
+    NULL AS Cumulative_API_Calls
+  FROM 
+    Top10Products t10p
+
+  UNION ALL
+
+  SELECT 
+    'Top10Users' AS Metric_Type,
+    t10u.duepp_month,
+    t10u.duepp_organization_name AS Entity,
+    NULL AS Product_Name,
+    t10u.total_volume AS Volume,
+    t10u.total_api_hits AS API_Hits,
+    NULL AS User_Count,
+    NULL AS Subscriber_Names,
+    NULL AS Cumulative_API_Calls
+  FROM 
+    Top10Users t10u
+
+  UNION ALL
+
+  SELECT 
+    'CumulativeAPICalls' AS Metric_Type,
+    cac.duepp_month,
+    NULL AS Entity,
+    NULL AS Product_Name,
+    NULL AS Volume,
+    NULL AS API_Hits,
+    NULL AS User_Count,
+    NULL AS Subscriber_Names,
+    cac.cumulative_api_calls AS Cumulative_API_Calls
+  FROM 
+    CumulativeAPICalls cac
+)
+SELECT 
+  *
+FROM 
+  CombinedResults
+ORDER BY 
+  Metric_Type, duepp_month;
+
+
 
 
