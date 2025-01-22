@@ -10,6 +10,8 @@ SELECT
   EXTRACT(YEAR FROM full_date) AS Year,      -- INTEGER (year part)
   EXTRACT(MONTH FROM full_date) AS Month,    -- INTEGER (month number: 1-12)
   FORMAT_TIMESTAMP('%B', TIMESTAMP(full_date)) AS Month_Name, -- STRING (month name: "January", "February", etc.)
+  EXTRACT(DAY FROM full_date) AS Day,        -- INTEGER (day of the month: 1-31)
+  FORMAT_TIMESTAMP('%A', TIMESTAMP(full_date)) AS Day_Name,  -- STRING (day name: "Monday", "Tuesday", etc.)
   DATE_TRUNC(full_date, MONTH) AS Month_Year_Date,  -- DATE (first day of the month)
   EXTRACT(QUARTER FROM full_date) AS Quarter -- INTEGER (quarter of the year)
 FROM 
