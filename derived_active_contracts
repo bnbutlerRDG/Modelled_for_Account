@@ -511,3 +511,188 @@ ORDER BY
   -- This pushes the 'Total' category row below the other categories
   CASE WHEN org_category_name = 'Total' THEN 1 ELSE 0 END,
   org_category_name;
+
+
+
+---------------------------------------
+
+
+
+-- Step 1: Get distinct organization categories
+WITH Categories AS (
+  SELECT DISTINCT 
+    org_category_name AS dac_org_category_name -- Unique organization category names
+  FROM 
+    rdmga4.RDMreports.org_type_file -- Source table for organization types
+  WHERE
+    org_category_name IS NOT NULL -- Exclude rows with NULL category names
+),
+
+-- Step 2: Generate all months from January 2023 to the current month
+Months AS (
+  SELECT 
+    DATE(
+      DATE_TRUNC(
+        DATE_ADD(DATE('2023-01-01'), INTERVAL n MONTH), -- Add months incrementally to the start date
+        MONTH -- Truncate to the first day of the month
+      )
+    ) AS dac_Month_Start -- Generated monthly date
+  FROM UNNEST(
+    GENERATE_ARRAY(
+      0, -- Start from 0 months
+      DATE_DIFF(CURRENT_DATE(), DATE('2023-01-01'), MONTH) -- Calculate the total number of months from start date to today
+    )
+  ) AS n
+),
+
+-- Step 3: Create all combinations of (month, category)
+AllMonthCategories AS (
+  SELECT
+    DATE(m.dac_Month_Start) AS dac_Date, -- Explicitly ensure the date is of type DATE
+    c.dac_org_category_name -- Category name
+  FROM
+    Months m
+    CROSS JOIN Categories c -- Generate all combinations of months and categories
+),
+
+-- Step 4: Deduplicate contracts to remove multiple versions for the same buyer and product
+DeduplicatedContracts AS (
+  SELECT
+    CAST(c.`Buyer BPID` AS STRING) AS dac_Buyer_BPID, -- Unique identifier for the buyer
+    c.`Contract Series Code` AS dac_Contract_Series_Code, -- Unique identifier for the contract
+    DATE(c.`Contract Start Date`) AS dac_Contract_Start_Date, -- Start date of the contract
+    DATE(c.`Contract Expiry Date`) AS dac_Contract_End_Date, -- Expiry date of the contract
+    o.org_category_name AS dac_org_category_name, -- Organization category name from the linked table
+    ROW_NUMBER() OVER (
+      PARTITION BY c.`Buyer BPID`, c.`Contract Series Code` -- Group contracts by buyer and product
+      ORDER BY c.`Contract Start Date` ASC -- Keep the earliest start date
+    ) AS dac_RowNum -- Rank contracts within each group for deduplication
+  FROM
+    rdmga4.RDMreports.contracts AS c -- Source table for contracts
+  LEFT JOIN
+    rdmga4.RDMreports.org_type_file AS o -- Link with organization category details
+    ON CAST(c.`Buyer BPID` AS STRING) = CAST(o.organization_bpid AS STRING) -- Match buyer BPID with organization BPID
+  WHERE
+    c.`Contract Start Date` IS NOT NULL -- Exclude contracts with missing start dates
+    AND c.`Contract Expiry Date` IS NOT NULL -- Exclude contracts with missing expiry dates
+),
+
+-- Step 5: Calculate active connections for each (month, category)
+ActiveConnections AS (
+  SELECT
+    DATE(
+      DATE_TRUNC(dac_Contract_Start_Date, MONTH) -- Truncate the contract start date to the first day of the month
+    ) AS dac_Active_Month,
+    dac_org_category_name, -- Organization category name
+    COUNT(
+      DISTINCT CONCAT(dac_Buyer_BPID, '-', dac_Contract_Series_Code) -- Unique connection identifier (buyer + contract)
+    ) AS dac_Active_Count -- Count of active connections
+  FROM
+    DeduplicatedContracts
+  WHERE
+    dac_RowNum = 1 -- Only include the first (deduplicated) contract for each buyer-product combination
+  GROUP BY
+    dac_Active_Month,
+    dac_org_category_name
+),
+
+-- Step 6: Calculate expired connections for each (month, category)
+ExpiredConnections AS (
+  SELECT
+    DATE(
+      DATE_TRUNC(DATE_ADD(dac_Contract_End_Date, INTERVAL 1 MONTH), MONTH) -- Move to the next month after expiry and truncate
+    ) AS dac_Expired_Month,
+    dac_org_category_name, -- Organization category name
+    COUNT(
+      DISTINCT CONCAT(dac_Buyer_BPID, '-', dac_Contract_Series_Code) -- Unique connection identifier (buyer + contract)
+    ) AS dac_Expired_Count -- Count of expired connections
+  FROM
+    DeduplicatedContracts
+  WHERE
+    dac_RowNum = 1 -- Only include the first (deduplicated) contract for each buyer-product combination
+  GROUP BY
+    dac_Expired_Month,
+    dac_org_category_name
+),
+
+-- Step 7: Merge active and expired counts into a single monthly summary for each category
+MonthlySummary AS (
+  SELECT
+    amc.dac_Date AS dac_Date, -- Month of activity
+    amc.dac_org_category_name, -- Organization category name
+    COALESCE(ac.dac_Active_Count, 0) AS dac_Active_in_month, -- Active connections count (default to 0 if none)
+    COALESCE(ec.dac_Expired_Count, 0) AS dac_Expired_in_month -- Expired connections count (default to 0 if none)
+  FROM
+    AllMonthCategories AS amc
+    LEFT JOIN ActiveConnections ac
+      ON amc.dac_Date = ac.dac_Active_Month -- Match by month
+      AND amc.dac_org_category_name = ac.dac_org_category_name -- Match by category
+    LEFT JOIN ExpiredConnections ec
+      ON amc.dac_Date = ec.dac_Expired_Month -- Match by month
+      AND amc.dac_org_category_name = ec.dac_org_category_name -- Match by category
+),
+
+-- Step 8: Calculate cumulative net active connections by category
+CumulativeSummary AS (
+  SELECT
+    dac_Date, -- Month of activity
+    dac_org_category_name, -- Organization category name
+    SUM(dac_Active_in_month) 
+      OVER (
+        PARTITION BY dac_org_category_name -- For each category
+        ORDER BY dac_Date -- Order by month
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW -- Include all rows up to the current one
+      )
+    - 
+    SUM(dac_Expired_in_month) 
+      OVER (
+        PARTITION BY dac_org_category_name
+        ORDER BY dac_Date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) AS dac_Total_Active_Data_Connections, -- Cumulative net active connections
+    dac_Active_in_month, -- Active connections in the current month
+    dac_Expired_in_month -- Expired connections in the current month
+  FROM
+    MonthlySummary
+),
+
+-- Step 9: Add a "Total" row to summarize across all categories per month
+FinalSummary AS (
+  SELECT
+    dac_Date,
+    dac_org_category_name,
+    dac_Active_in_month,
+    dac_Expired_in_month,
+    dac_Total_Active_Data_Connections
+  FROM
+    CumulativeSummary
+  
+  UNION ALL
+  
+  SELECT
+    dac_Date,
+    "Total" AS dac_org_category_name, -- Label for total row
+    SUM(dac_Active_in_month) AS dac_Active_in_month, -- Total active connections
+    SUM(dac_Expired_in_month) AS dac_Expired_in_month, -- Total expired connections
+    SUM(dac_Total_Active_Data_Connections) AS dac_Total_Active_Data_Connections -- Total cumulative connections
+  FROM
+    CumulativeSummary
+  GROUP BY
+    dac_Date
+)
+
+-- Step 10: Final output with ordering
+SELECT
+  dac_Date, -- Date of activity
+  dac_org_category_name, -- Organization category name
+  dac_Active_in_month AS dac_Active, -- Active connections in the current month
+  dac_Expired_in_month AS dac_Expired, -- Expired connections in the current month
+  dac_Total_Active_Data_Connections -- Cumulative net active connections
+FROM
+  FinalSummary
+WHERE
+  dac_Date BETWEEN DATE('2023-01-01') AND CURRENT_DATE() -- Limit results to valid dates
+ORDER BY
+  dac_Date, -- Order by date
+  CASE WHEN dac_org_category_name = 'Total' THEN 1 ELSE 0 END, -- Push "Total" rows to the bottom
+  dac_org_category_name; -- Further order by category name
