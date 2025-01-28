@@ -356,3 +356,117 @@ ORDER BY
     Product_Series_Code,
     Consumer_Organization_Name
 
+
+
+------------------------------------------
+
+-- Step 1: Extract product details, including their license types, states, and published dates
+WITH Product_Details AS (
+    SELECT DISTINCT
+        `Product Series Code` AS dplt_Product_Series_Code, -- Unique identifier for each product series
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS dplt_Data_Product_Name, -- Name of the product; defaults to 'Unnamed Product' if NULL
+        SAFE_CAST(`Published Date` AS DATE) AS dplt_Published_Date, -- Convert the published date into a DATE type for consistency
+        `License Type` AS dplt_License_Type, -- Type of license for the product (e.g., Free, Paid)
+        State AS dplt_State -- Current state of the product (e.g., active, expired)
+    FROM `rdmga4.RDMreports.raw_data_product_details` -- Source table containing raw product details
+),
+
+-- Step 2: Extract publisher organization details, including names and registration dates
+Publisher_Details AS (
+    SELECT DISTINCT
+        CAST(`BPID` AS STRING) AS dplt_BPID, -- Unique identifier for each publisher organization (converted to STRING for consistency)
+        `Organization Name` AS dplt_Publisher_Organization_Name, -- Name of the publisher organization
+        SAFE_CAST(`Request approved at` AS DATE) AS dplt_Publisher_Registration_Date -- Date when the publisher organization was registered (converted to DATE type)
+    FROM `rdmga4.RDMreports.raw_organization_overview` -- Source table containing organization details
+),
+
+-- Step 3: Extract consumer organization details, including names and registration dates
+Consumer_Details AS (
+    SELECT DISTINCT
+        CAST(`BPID` AS STRING) AS dplt_BPID, -- Unique identifier for each consumer organization (converted to STRING for consistency)
+        `Organization Name` AS dplt_Consumer_Organization_Name, -- Name of the consumer organization
+        SAFE_CAST(`Request approved at` AS DATE) AS dplt_Consumer_Registration_Date -- Date when the consumer organization was registered (converted to DATE type)
+    FROM `rdmga4.RDMreports.raw_organization_overview` -- Source table containing organization details
+),
+
+-- Step 4: Extract contract details for all products, maintaining multiple versions of contracts
+Contract_Details AS (
+    SELECT
+        CAST(`Buyer BPID` AS STRING) AS dplt_Buyer_BPID, -- Unique identifier for the buyer (consumer organization)
+        CAST(`Seller BPID` AS STRING) AS dplt_Seller_BPID, -- Unique identifier for the seller (publisher organization)
+        `Product Series Code` AS dplt_Product_Series_Code, -- Identifier linking the contract to a specific product series
+        `Contract Series Code` AS dplt_Contract_Series_Code, -- Unique identifier for each contract series
+        SAFE_CAST(`Contract Start Date` AS DATE) AS dplt_Contract_Start_Date, -- Contract start date (converted to DATE type)
+        SAFE_CAST(`Contract Expiry Date` AS DATE) AS dplt_Contract_End_Date, -- Contract end date (converted to DATE type)
+        `Version Number` AS dplt_Version_Number -- Version of the contract for tracking updates
+    FROM `rdmga4.RDMreports.contracts` -- Source table containing contract information
+    WHERE `Product Series Code` IS NOT NULL -- Exclude rows where the product series code is missing (not relevant)
+),
+
+-- Step 5: Summarize API call data at the contract level
+API_Call_Summary AS (
+    SELECT
+        CAST(dc.`Contract Code` AS STRING) AS dplt_Contract_Code, -- Unique contract code (converted to STRING for consistency)
+        SUM(dc.`Total number of Hits`) AS dplt_Total_API_Calls -- Total number of API calls associated with the contract
+    FROM `rdmga4.RDMreports.daily_consumption` dc -- Source table containing daily API call data
+    GROUP BY dplt_Contract_Code -- Aggregate API calls at the contract level
+),
+
+-- Step 6: Combine product, contract, publisher, consumer, and API call data
+Combined_Data AS (
+    SELECT
+        pd.dplt_Product_Series_Code, -- Product series code from the product details
+        pd.dplt_Data_Product_Name, -- Name of the product
+        pd.dplt_License_Type, -- Type of license for the product
+        pd.dplt_Published_Date, -- Published date of the product
+        pd.dplt_State, -- State of the product (e.g., active, expired)
+        cd.dplt_Contract_Series_Code, -- Contract series code from the contract details
+        cd.dplt_Contract_Start_Date, -- Contract start date
+        cd.dplt_Contract_End_Date, -- Contract end date
+        pub.dplt_Publisher_Organization_Name, -- Name of the publisher organization
+        pub.dplt_Publisher_Registration_Date, -- Registration date of the publisher organization
+        cons.dplt_Consumer_Organization_Name, -- Name of the consumer organization
+        cons.dplt_Consumer_Registration_Date, -- Registration date of the consumer organization
+        COALESCE(api.dplt_Total_API_Calls, 0) AS dplt_Total_API_Calls, -- Total API calls associated with the contract; default to 0 if no data available
+        ROW_NUMBER() OVER (
+            PARTITION BY 
+                pd.dplt_Product_Series_Code, -- Group by product series code
+                cd.dplt_Buyer_BPID, -- Group by buyer
+                cd.dplt_Seller_BPID -- Group by seller
+            ORDER BY 
+                cd.dplt_Contract_Start_Date DESC, -- Prioritize contracts with later start dates
+                cd.dplt_Version_Number DESC -- Within the same start date, prioritize higher versions
+        ) AS dplt_rn -- Assign a row number to each grouped combination for deduplication
+    FROM Product_Details pd -- Start with product details
+    LEFT JOIN Contract_Details cd
+        ON pd.dplt_Product_Series_Code = cd.dplt_Product_Series_Code -- Link contract details using product series code
+    LEFT JOIN Publisher_Details pub
+        ON cd.dplt_Seller_BPID = pub.dplt_BPID -- Link publisher details using seller BPID
+    LEFT JOIN Consumer_Details cons
+        ON cd.dplt_Buyer_BPID = cons.dplt_BPID -- Link consumer details using buyer BPID
+    LEFT JOIN API_Call_Summary api
+        ON cd.dplt_Contract_Series_Code = api.dplt_Contract_Code -- Link API call data using contract series code
+)
+
+-- Step 7: Produce the final output by filtering deduplicated data and selecting required columns
+SELECT
+    dplt_Product_Series_Code, -- Product series code
+    dplt_Data_Product_Name, -- Name of the product
+    dplt_License_Type, -- Type of license for the product
+    dplt_Published_Date AS dplt_Product_Published_Date, -- Published date of the product
+    dplt_State, -- Current state of the product
+    dplt_Contract_Series_Code, -- Contract series code
+    dplt_Total_API_Calls, -- Total API calls for the product
+    dplt_Consumer_Organization_Name, -- Name of the consumer organization
+    dplt_Consumer_Registration_Date, -- Registration date of the consumer organization
+    dplt_Publisher_Organization_Name, -- Name of the publisher organization
+    dplt_Publisher_Registration_Date, -- Registration date of the publisher organization
+    dplt_Contract_Start_Date, -- Start date of the contract
+    dplt_Contract_End_Date -- End date of the contract
+FROM Combined_Data
+WHERE dplt_rn = 1 OR dplt_rn IS NULL -- Include only the most relevant contract for each product or rows without contracts
+ORDER BY 
+    dplt_Product_Series_Code, -- Sort by product series code
+    dplt_Consumer_Organization_Name; -- Further sort by consumer organization name
+
+
