@@ -325,3 +325,159 @@ LEFT JOIN
     Approval_Status aps ON dc.Status_Date = aps.Status_Date
 ORDER BY 
     Status_Date;
+
+
+
+
+
+
+----------------------------------------
+commented
+
+-- Extract product details with required columns and apply initial filters
+WITH Product_Details AS (
+    SELECT 
+        `Product Series Code` AS dppo_Product_Series_Code, -- Unique code for each product series
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS dppo_Data_Product_Name, -- Default name if NULL
+        SAFE_CAST(`Published Date` AS DATE) AS dppo_Published_Date, -- Convert published date to DATE type
+        `Version Number` AS dppo_Version_Number, -- Version of the product
+        `State` AS dppo_State -- State of the product (e.g., active or expired)
+    FROM 
+        `rdmga4.RDMreports.raw_data_product_details`
+    WHERE 
+        `State` IN ('active', 'expired') -- Include only active and expired products
+),
+
+-- Extract contract details with relevant fields and filter for valid contracts
+Contract_Details AS (
+    SELECT 
+        `Product Series Code` AS dppo_Product_Series_Code, -- Product series linked to the contract
+        SAFE_CAST(`Sunsetting Date` AS DATE) AS dppo_Sunsetting_Date, -- Date when the product is no longer available
+        CAST(`Seller BPID` AS STRING) AS dppo_Seller_BPID, -- Seller ID (linked to organization)
+        CAST(`Buyer BPID` AS STRING) AS dppo_Buyer_BPID -- Buyer ID (linked to organization)
+    FROM 
+        `rdmga4.RDMreports.contracts`
+    WHERE 
+        SAFE_CAST(`Sunsetting Date` AS DATE) >= DATE('2023-01-01') -- Include contracts valid from 2023 onward
+        OR `Sunsetting Date` IS NULL -- Include contracts with no end date
+),
+
+-- Extract organization details with relevant fields and filter for approved requests
+Organization_Details AS (
+    SELECT 
+        CAST(`BPID` AS STRING) AS dppo_BPID, -- Unique identifier for the organization
+        `Organization Name` AS dppo_Organization_Name, -- Organization's name
+        SAFE_CAST(`Request approved at` AS DATE) AS dppo_Consumer_Approval_Date -- Approval date of the consumer
+    FROM 
+        `rdmga4.RDMreports.raw_organization_overview`
+    WHERE 
+        `Request approved at` IS NOT NULL -- Include only approved organizations
+),
+
+-- Combine product, contract, and organization details to create a unified dataset for active products
+Active_Products AS (
+    SELECT 
+        pd.dppo_Product_Series_Code, -- Product series code
+        pd.dppo_Data_Product_Name, -- Product name
+        pd.dppo_Published_Date, -- Published date
+        cd.dppo_Sunsetting_Date, -- Sunsetting date
+        pub_org.dppo_Organization_Name AS dppo_Publisher_Organization_Name, -- Publisher organization
+        cons_org.dppo_Organization_Name AS dppo_Consumer_Organization_Name, -- Consumer organization
+        pd.dppo_State, -- State of the product
+        -- Determine if the product is active today
+        CASE
+            WHEN pd.dppo_State = 'expired' AND cd.dppo_Sunsetting_Date <= CURRENT_DATE() THEN FALSE
+            WHEN pd.dppo_Published_Date > CURRENT_DATE() THEN FALSE
+            WHEN pd.dppo_State = 'active' OR cd.dppo_Sunsetting_Date > CURRENT_DATE() THEN TRUE
+            ELSE FALSE
+        END AS dppo_Is_Active_Today,
+        -- Determine activation and expiration dates
+        GREATEST(pd.dppo_Published_Date, DATE('2023-01-01')) AS dppo_Activation_Date, -- Activation date
+        cd.dppo_Sunsetting_Date AS dppo_Expiration_Date -- Expiration date
+    FROM 
+        Product_Details pd
+    LEFT JOIN 
+        Contract_Details cd ON pd.dppo_Product_Series_Code = cd.dppo_Product_Series_Code -- Join with contract details
+    LEFT JOIN 
+        Organization_Details pub_org ON cd.dppo_Seller_BPID = pub_org.dppo_BPID -- Join with publisher organization details
+    LEFT JOIN 
+        Organization_Details cons_org ON cd.dppo_Buyer_BPID = cons_org.dppo_BPID -- Join with consumer organization details
+    WHERE 
+        pd.dppo_Published_Date <= CURRENT_DATE() -- Include only products published before or on the current date
+),
+
+-- Create a date spine from January 1, 2023, to the current date for daily analysis
+Date_Spine AS (
+    SELECT date AS dppo_Date
+    FROM UNNEST(GENERATE_DATE_ARRAY(
+        DATE('2023-01-01'), -- Start date
+        CURRENT_DATE(), -- End date
+        INTERVAL 1 DAY -- Daily intervals
+    )) AS date
+),
+
+-- Generate daily product status based on activation and expiration dates
+Daily_Product_Status AS (
+    SELECT
+        ds.dppo_Date AS dppo_Status_Date, -- Specific date for analysis
+        ap.dppo_Product_Series_Code, -- Product series code
+        ap.dppo_Publisher_Organization_Name, -- Publisher organization
+        ap.dppo_Consumer_Organization_Name, -- Consumer organization
+        -- Determine if the product is active on a specific date
+        CASE
+            WHEN ap.dppo_Activation_Date <= ds.dppo_Date 
+                 AND (ap.dppo_Expiration_Date IS NULL OR ap.dppo_Expiration_Date > ds.dppo_Date)
+                 AND (ap.dppo_State = 'active' OR ds.dppo_Date < ap.dppo_Expiration_Date)
+            THEN TRUE
+            ELSE FALSE
+        END AS dppo_Is_Active_On_Date
+    FROM 
+        Date_Spine ds
+    CROSS JOIN 
+        Active_Products ap -- Combine each date with all active products
+),
+
+-- Calculate daily counts of publishers, consumers, and active products
+Daily_Counts AS (
+    SELECT 
+        dppo_Status_Date, -- Date for analysis
+        COUNT(DISTINCT CASE WHEN dppo_Is_Active_On_Date THEN dppo_Publisher_Organization_Name END) AS dppo_Distinct_Publisher_Count, -- Count of distinct publishers
+        COUNT(DISTINCT CASE WHEN dppo_Is_Active_On_Date THEN dppo_Consumer_Organization_Name END) AS dppo_Distinct_Consumer_Count, -- Count of distinct consumers
+        COUNT(DISTINCT CASE WHEN dppo_Is_Active_On_Date THEN dppo_Product_Series_Code END) AS dppo_Products_Active_Count -- Count of active products
+    FROM 
+        Daily_Product_Status
+    GROUP BY 
+        dppo_Status_Date
+),
+
+-- Calculate approval status for consumers and publishers
+Approval_Status AS (
+    SELECT 
+        ds.dppo_Date AS dppo_Status_Date, -- Specific date for approval status
+        COUNT(DISTINCT CASE WHEN od.dppo_Consumer_Approval_Date <= ds.dppo_Date THEN od.dppo_BPID END) AS dppo_Approved_Consumers, -- Count of approved consumers
+        COUNT(DISTINCT CASE WHEN ctp.`Upgrade request approval date` <= ds.dppo_Date THEN ctp.BPID END) AS dppo_Approved_Publishers -- Count of approved publishers
+    FROM 
+        Date_Spine ds
+    CROSS JOIN Organization_Details od -- Combine each date with organization details
+    LEFT JOIN `rdmga4.RDMreports.consumer_to_publisher` ctp 
+        ON ctp.`Upgrade request approval date` IS NOT NULL -- Include only approved upgrades
+    GROUP BY 
+        ds.dppo_Date
+)
+
+-- Final result: Combine daily counts and approval status for reporting
+SELECT 
+    dc.dppo_Status_Date, -- Date of analysis
+    dc.dppo_Distinct_Publisher_Count, -- Count of distinct publishers
+    dc.dppo_Distinct_Consumer_Count, -- Count of distinct consumers
+    dc.dppo_Products_Active_Count, -- Count of active products
+    COALESCE(aps.dppo_Approved_Consumers, 0) AS dppo_Approved_Consumers, -- Approved consumers (default to 0 if NULL)
+    dc.dppo_Distinct_Publisher_Count AS dppo_Publishers_In_Contracts, -- Publishers in contracts
+    COALESCE(aps.dppo_Approved_Publishers, 0) AS dppo_Approved_Publishers, -- Approved publishers (default to 0 if NULL)
+    dc.dppo_Products_Active_Count AS dppo_Unique_Products -- Unique products
+FROM 
+    Daily_Counts dc
+LEFT JOIN 
+    Approval_Status aps ON dc.dppo_Status_Date = aps.dppo_Status_Date -- Join approval status with daily counts
+ORDER BY 
+    dppo_Status_Date; -- Order results by date
