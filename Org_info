@@ -1,0 +1,31 @@
+-- Step 1: Extract all approved publishers from consumer_to_publisher
+WITH Publisher_Organizations AS (
+    SELECT DISTINCT
+        CAST(`BPID` AS STRING) AS orginf_Publisher_BPID, 
+        `Organization Name` AS orginf_Publisher_Organization_Name, 
+        SAFE_CAST(`Upgrade request approval date` AS DATE) AS orginf_Publisher_Registration_Date
+    FROM `rdmga4.RDMreports.consumer_to_publisher`
+    WHERE `Upgrade request approval date` IS NOT NULL
+),
+
+-- Step 2: Extract all approved consumers from raw_organization_overview
+Consumer_Organizations AS (
+    SELECT DISTINCT
+        CAST(`BPID` AS STRING) AS orginf_Consumer_BPID, 
+        `Organization Name` AS orginf_Consumer_Organization_Name, 
+        SAFE_CAST(`Request approved at` AS DATE) AS orginf_Consumer_Registration_Date
+    FROM `rdmga4.RDMreports.raw_organization_overview`
+    WHERE `Request approved at` IS NOT NULL
+)
+
+-- Step 3: Return full list of approved publishers and consumers with proper date casting
+SELECT 
+    pub.orginf_Publisher_Organization_Name, 
+    SAFE_CAST(pub.orginf_Publisher_Registration_Date AS DATE) AS orginf_Publisher_Registration_Date, 
+    cons.orginf_Consumer_Organization_Name, 
+    SAFE_CAST(cons.orginf_Consumer_Registration_Date AS DATE) AS orginf_Consumer_Registration_Date
+FROM Publisher_Organizations pub
+FULL OUTER JOIN Consumer_Organizations cons 
+    ON pub.orginf_Publisher_BPID = cons.orginf_Consumer_BPID
+ORDER BY 
+    orginf_Publisher_Registration_Date, orginf_Consumer_Registration_Date;
