@@ -1,0 +1,155 @@
+-- 1) Product Series Status
+-- This CTE determines the overall status of each product series based on its state.
+WITH Product_Series_Status AS (
+   SELECT
+       dplt_product_series_code,
+       CASE 
+           -- If all records for a product series are 'expired', mark it as 'expired'.
+           WHEN SUM(CASE WHEN dplt_state = 'expired' THEN 1 ELSE 0 END) = COUNT(*) THEN 'expired'
+           ELSE 'active'
+       END AS dplt_overall_product_status
+   FROM (
+       SELECT
+           `Product Series Code` AS dplt_product_series_code,
+           `State` AS dplt_state
+       FROM `rdmga4.RDMreports.raw_data_product_details`
+       WHERE `State` IN ('active', 'expired')
+   )
+   GROUP BY dplt_product_series_code
+),
+
+-- 2) Product Details
+-- This CTE extracts product-related details including name, publication date, and license type.
+Product_Details AS (
+   SELECT
+       `Product Series Code` AS dplt_product_series_code,
+       COALESCE(`Data Product Name`, 'Unnamed Product') AS dplt_data_product_name,
+       SAFE_CAST(`Published Date` AS DATE) AS dplt_published_date,
+       `State` AS dplt_state,
+       `License Type` AS dplt_license_type
+   FROM `rdmga4.RDMreports.raw_data_product_details`
+   WHERE `State` IN ('active', 'expired')
+),
+
+-- 3) Contract Details
+-- This CTE extracts contract-related details such as seller ID and sunsetting date.
+Contract_Details AS (
+   SELECT
+       `Product Series Code` AS dplt_product_series_code,
+       SAFE_CAST(`Sunsetting Date` AS DATE) AS dplt_sunsetting_date,
+       CAST(`Seller BPID` AS STRING) AS dplt_seller_bpid
+   FROM `rdmga4.RDMreports.contracts`
+),
+
+-- 4) Organization Details
+-- Extracts organization details such as publisher name and BPID.
+Organization_Details AS (
+   SELECT
+       CAST(`BPID` AS STRING) AS dplt_publisher_bpid,
+       `Organization Name` AS dplt_publisher_organization_name
+   FROM `rdmga4.RDMreports.raw_organization_overview`
+),
+
+-- 5) Combined Product Data
+-- Joins the previous CTEs to create a unified dataset of product details.
+Combined_Product_Data AS (
+   SELECT
+       pd.dplt_product_series_code,
+       pd.dplt_data_product_name,
+       pd.dplt_license_type,
+       pd.dplt_published_date,
+       pd.dplt_state,
+       cd.dplt_sunsetting_date,
+       org.dplt_publisher_organization_name,
+       pss.dplt_overall_product_status
+   FROM Product_Details pd
+   JOIN Product_Series_Status pss 
+       ON pd.dplt_product_series_code = pss.dplt_product_series_code
+   INNER JOIN Contract_Details cd
+       ON pd.dplt_product_series_code = cd.dplt_product_series_code
+   LEFT JOIN Organization_Details org
+       ON cd.dplt_seller_bpid = org.dplt_publisher_bpid
+),
+
+-- 6) Active Periods
+-- Defines active time periods for each product, handling expiration.
+Active_Periods AS (
+   SELECT
+       dplt_product_series_code,
+       dplt_data_product_name,
+       dplt_license_type,
+       dplt_publisher_organization_name,
+       COALESCE(dplt_published_date, DATE('2023-01-01')) AS dplt_start_date,
+       CASE
+           WHEN dplt_overall_product_status = 'expired' THEN dplt_sunsetting_date
+           ELSE DATE_TRUNC(CURRENT_DATE(), MONTH)
+       END AS dplt_end_date,
+       dplt_overall_product_status AS dplt_current_product_status
+   FROM Combined_Product_Data
+   WHERE dplt_sunsetting_date IS NULL
+         OR dplt_sunsetting_date >= DATE('2023-01-01')
+),
+
+-- 7) Expanded Active Periods
+-- Generates a date array for each active product to track its activity over months.
+Expanded_Active_Periods AS (
+   SELECT
+       dplt_product_series_code,
+       dplt_data_product_name,
+       dplt_license_type,
+       dplt_publisher_organization_name,
+       dplt_current_product_status,
+       dplt_month_date
+   FROM Active_Periods
+   CROSS JOIN UNNEST(
+       GENERATE_DATE_ARRAY(
+           DATE_TRUNC(dplt_start_date, MONTH),
+           LEAST(DATE_TRUNC(dplt_end_date, MONTH),
+                 DATE_TRUNC(CURRENT_DATE(), MONTH)),
+           INTERVAL 1 MONTH
+       )
+   ) AS dplt_month_date
+),
+
+-- 8) First Active Month
+-- Determines the first active month for each product series.
+First_Active_Month AS (
+   SELECT
+       dplt_product_series_code,
+       dplt_data_product_name,
+       dplt_license_type,
+       dplt_publisher_organization_name,
+       DATE_TRUNC(MIN(dplt_start_date), MONTH) AS dplt_first_active_month
+   FROM Active_Periods
+   GROUP BY
+       dplt_product_series_code,
+       dplt_data_product_name,
+       dplt_license_type,
+       dplt_publisher_organization_name
+)
+
+-- 9) Final SELECT
+-- Retrieves the final dataset, classifying products as 'New' or 'Existing' per month.
+SELECT
+   DATE_TRUNC(eap.dplt_month_date, MONTH) AS dplt_month,
+   eap.dplt_product_series_code,
+   eap.dplt_data_product_name,
+   eap.dplt_license_type,
+   eap.dplt_publisher_organization_name,
+   eap.dplt_current_product_status,
+   
+   CASE
+      WHEN eap.dplt_month_date = fam.dplt_first_active_month 
+           THEN 'New' 
+      ELSE 'Existing'
+   END AS dplt_product_state_for_month
+
+FROM Expanded_Active_Periods eap
+LEFT JOIN First_Active_Month fam
+  ON eap.dplt_product_series_code = fam.dplt_product_series_code
+ AND eap.dplt_license_type = fam.dplt_license_type
+ AND eap.dplt_publisher_organization_name = fam.dplt_publisher_organization_name
+
+ORDER BY
+   dplt_month,
+   eap.dplt_product_series_code;
