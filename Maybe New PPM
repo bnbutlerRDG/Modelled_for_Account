@@ -1,0 +1,168 @@
+WITH monthly_dates AS (
+    -- Generate a list of months from January 2023 to the current month
+    SELECT 
+        CAST(FORMAT_DATE('%Y-%m-01', DATE(month_date)) AS DATE) AS month_date
+    FROM 
+        UNNEST(GENERATE_DATE_ARRAY('2023-01-01', CURRENT_DATE(), INTERVAL 1 MONTH)) AS month_date
+),
+
+DeduplicatedContracts AS (
+    -- Deduplicate contracts by ensuring one entry per Buyer BPID and Contract Series Code
+    SELECT
+        CAST(`Contract Code` AS STRING) AS Contract_Code,
+        CAST(`Buyer BPID` AS STRING) AS Buyer_BPID,
+        CAST(`Seller BPID` AS STRING) AS Seller_BPID,
+        `Contract Start Date`,
+        `Contract Expiry Date`,
+        `Data Product Code`,
+        ROW_NUMBER() OVER (
+            PARTITION BY CAST(`Buyer BPID` AS STRING), `Contract Series Code`
+            ORDER BY `Contract Start Date` ASC
+        ) AS RowNum
+    FROM 
+        `rdmga4.RDMreports.contracts`
+    WHERE 
+        `Contract Start Date` IS NOT NULL
+        AND `Buyer BPID` IS NOT NULL -- Exclude NULL Buyer BPIDs
+),
+
+DeduplicatedDailyConsumption AS (
+    -- Deduplicate daily consumption data by Contract Code and Metrics Collection Date
+    SELECT DISTINCT
+        CAST(`Contract Code` AS STRING) AS Contract_Code,
+        `Metrics Collection Date`,
+        COALESCE(`Total number of Hits`, 0) AS Total_Hits,
+        COALESCE(`Total Volume Consumed in Bytes`, 0) AS Total_Volume
+    FROM 
+        `rdmga4.RDMreports.daily_consumption`
+),
+
+ContractDetails AS (
+    -- Expand contracts into their active months based on Start and Expiry Dates
+    SELECT 
+        GENERATE_DATE_ARRAY(
+            DATE_TRUNC(c.`Contract Start Date`, MONTH), 
+            DATE_TRUNC(DATE_ADD(COALESCE(c.`Contract Expiry Date`, CURRENT_DATE()), INTERVAL 1 MONTH), MONTH), 
+            INTERVAL 1 MONTH
+        ) AS active_months,
+        c.Contract_Code,
+        dpd.`Data Product Name` AS ppm_product,
+        c.Buyer_BPID,
+        c.Seller_BPID,
+        ro.`Organization Name` AS ppm_consumer,
+        ro_seller.`Organization Name` AS ppm_publisher
+    FROM 
+        DeduplicatedContracts c
+    LEFT JOIN 
+        `rdmga4.RDMreports.raw_data_product_details` dpd 
+        ON c.`Data Product Code` = dpd.`Data Product Code`
+    LEFT JOIN 
+        `rdmga4.RDMreports.raw_organization_overview` ro 
+        ON c.Buyer_BPID = CAST(ro.`BPID` AS STRING)
+    LEFT JOIN 
+        `rdmga4.RDMreports.raw_organization_overview` ro_seller
+        ON c.Seller_BPID = CAST(ro_seller.`BPID` AS STRING)
+    WHERE 
+        c.RowNum = 1
+),
+
+ExpandedContracts AS (
+    -- Unnest the active months so each contract appears per active month
+    SELECT 
+        active_month AS ppm_month,
+        Contract_Code,
+        ppm_product,
+        Buyer_BPID,
+        Seller_BPID,
+        ppm_consumer,
+        ppm_publisher
+    FROM 
+        ContractDetails, UNNEST(active_months) AS active_month
+),
+
+final_data AS (
+    -- Aggregate active contracts per product and month
+    SELECT 
+        ROW_NUMBER() OVER() AS ppm_id,
+        ec.ppm_publisher,
+        ec.ppm_consumer,
+        ec.ppm_product,
+        md.month_date AS ppm_month,
+        
+        -- Active contracts per product per month
+        COUNT(DISTINCT CASE 
+            WHEN md.month_date BETWEEN DATE_TRUNC(c.`Contract Start Date`, MONTH) 
+                                   AND DATE_TRUNC(DATE_ADD(COALESCE(c.`Contract Expiry Date`, CURRENT_DATE()), INTERVAL 1 MONTH), MONTH)
+            THEN c.Buyer_BPID
+        END) AS ppm_total_consumers,
+
+        -- Users with API calls
+        COUNT(DISTINCT CASE 
+            WHEN c.Contract_Code IN (SELECT contract_code FROM DeduplicatedDailyConsumption) 
+            THEN c.Buyer_BPID 
+        END) AS ppm_users_with_api_calls_all_time,
+
+        -- Users without API calls
+        COUNT(DISTINCT CASE 
+            WHEN c.Contract_Code NOT IN (SELECT contract_code FROM DeduplicatedDailyConsumption) 
+            THEN c.Buyer_BPID 
+        END) AS ppm_users_no_api_calls_all_time,
+
+        -- Total API hits
+        SUM(COALESCE(dc.Total_Hits, 0)) AS ppm_total_hits,
+
+        -- Total Volume Consumed
+        SUM(COALESCE(dc.Total_Volume, 0)) AS ppm_total_volume,
+
+        -- Cumulative active contracts over time
+        SUM(
+            COUNT(DISTINCT CASE 
+                WHEN md.month_date BETWEEN DATE_TRUNC(c.`Contract Start Date`, MONTH) 
+                                       AND DATE_TRUNC(DATE_ADD(COALESCE(c.`Contract Expiry Date`, CURRENT_DATE()), INTERVAL 1 MONTH), MONTH)
+                THEN c.Buyer_BPID
+            END)
+        ) OVER (
+            PARTITION BY ec.ppm_product
+            ORDER BY md.month_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS ppm_cumulative_active_contracts
+
+    FROM 
+        monthly_dates AS md
+    LEFT JOIN 
+        ExpandedContracts AS ec
+    ON 
+        md.month_date = ec.ppm_month
+    LEFT JOIN 
+        DeduplicatedContracts AS c
+    ON 
+        ec.Contract_Code = c.Contract_Code
+    LEFT JOIN 
+        DeduplicatedDailyConsumption AS dc
+    ON 
+        c.Contract_Code = dc.Contract_Code
+        AND DATE_TRUNC(dc.`Metrics Collection Date`, MONTH) = md.month_date
+    LEFT JOIN 
+        `rdmga4.RDMreports.raw_organization_overview` AS ro_buyer
+    ON 
+        c.Buyer_BPID = CAST(ro_buyer.`BPID` AS STRING)
+    LEFT JOIN 
+        `rdmga4.RDMreports.raw_organization_overview` AS ro_seller
+    ON 
+        c.Seller_BPID = CAST(ro_seller.`BPID` AS STRING)
+    LEFT JOIN 
+        `rdmga4.RDMreports.raw_data_product_details` AS dpd
+    ON 
+        c.`Data Product Code` = dpd.`Data Product Code`
+    WHERE 
+        ro_buyer.`Organization Name` IS NOT NULL
+    GROUP BY 
+        ec.ppm_publisher, ec.ppm_consumer, ec.ppm_product, ppm_month
+)
+
+-- Final output with ordering
+SELECT 
+    *
+FROM 
+    final_data
+ORDER BY 
+    ppm_month, ppm_publisher, ppm_product, ppm_consumer;
