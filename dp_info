@@ -1,0 +1,108 @@
+-- Step 1: Extract product details, including their license types, states, and published dates
+WITH Product_Details AS (
+    SELECT DISTINCT
+        `Product Series Code` AS dp_info_Product_Series_Code, -- Unique identifier for each product series
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS dp_info_Data_Product_Name, -- Name of the product; defaults to 'Unnamed Product' if NULL
+        SAFE_CAST(`Published Date` AS DATE) AS dp_info_Published_Date, -- Convert the published date into a DATE type for consistency
+        `License Type` AS dp_info_License_Type, -- Type of license for the product (e.g., Free, Paid)
+        State AS dp_info_State -- Current state of the product (e.g., active, expired)
+    FROM `rdmga4.RDMreports.raw_data_product_details`
+),
+
+-- Step 2: Extract publisher organization details, including names and registration dates
+Publisher_Details AS (
+    SELECT DISTINCT
+        CAST(`BPID` AS STRING) AS dp_info_BPID, -- Unique identifier for each publisher organization (converted to STRING for consistency)
+        `Organization Name` AS dp_info_Publisher_Organization_Name, -- Name of the publisher organization
+        SAFE_CAST(`Request approved at` AS DATE) AS dp_info_Publisher_Registration_Date -- Date when the publisher organization was registered (converted to DATE type)
+    FROM `rdmga4.RDMreports.raw_organization_overview`
+),
+
+-- Step 3: Extract consumer organization details, including names and registration dates
+Consumer_Details AS (
+    SELECT DISTINCT
+        CAST(`BPID` AS STRING) AS dp_info_BPID, -- Unique identifier for each consumer organization (converted to STRING for consistency)
+        `Organization Name` AS dp_info_Consumer_Organization_Name, -- Name of the consumer organization
+        SAFE_CAST(`Request approved at` AS DATE) AS dp_info_Consumer_Registration_Date -- Date when the consumer organization was registered (converted to DATE type)
+    FROM `rdmga4.RDMreports.raw_organization_overview`
+),
+
+-- Step 4: Extract contract details for all products, maintaining multiple versions of contracts
+Contract_Details AS (
+    SELECT
+        CAST(`Buyer BPID` AS STRING) AS dp_info_Buyer_BPID, -- Unique identifier for the buyer (consumer organization)
+        CAST(`Seller BPID` AS STRING) AS dp_info_Seller_BPID, -- Unique identifier for the seller (publisher organization)
+        `Product Series Code` AS dp_info_Product_Series_Code, -- Identifier linking the contract to a specific product series
+        `Contract Series Code` AS dp_info_Contract_Series_Code, -- Unique identifier for each contract series
+        SAFE_CAST(`Contract Start Date` AS DATE) AS dp_info_Contract_Start_Date, -- Contract start date (converted to DATE type)
+        SAFE_CAST(`Contract Expiry Date` AS DATE) AS dp_info_Contract_End_Date, -- Contract end date (converted to DATE type)
+        `Version Number` AS dp_info_Version_Number -- Version of the contract for tracking updates
+    FROM `rdmga4.RDMreports.contracts`
+    WHERE `Product Series Code` IS NOT NULL
+),
+
+-- Step 5: Summarize API call data at the contract level
+API_Call_Summary AS (
+    SELECT
+        CAST(dc.`Contract Code` AS STRING) AS dp_info_Contract_Code, -- Unique contract code (converted to STRING for consistency)
+        SUM(dc.`Total number of Hits`) AS dp_info_Total_API_Calls -- Total number of API calls associated with the contract
+    FROM `rdmga4.RDMreports.daily_consumption` dc
+    GROUP BY dp_info_Contract_Code
+),
+
+-- Step 6: Combine product, contract, publisher, consumer, and API call data
+Combined_Data AS (
+    SELECT
+        pd.dp_info_Product_Series_Code,
+        pd.dp_info_Data_Product_Name,
+        pd.dp_info_License_Type,
+        pd.dp_info_Published_Date,
+        pd.dp_info_State,
+        cd.dp_info_Contract_Series_Code,
+        cd.dp_info_Contract_Start_Date,
+        cd.dp_info_Contract_End_Date,
+        pub.dp_info_Publisher_Organization_Name,
+        pub.dp_info_Publisher_Registration_Date,
+        cons.dp_info_Consumer_Organization_Name,
+        cons.dp_info_Consumer_Registration_Date,
+        COALESCE(api.dp_info_Total_API_Calls, 0) AS dp_info_Total_API_Calls,
+        ROW_NUMBER() OVER (
+            PARTITION BY 
+                pd.dp_info_Product_Series_Code,
+                cd.dp_info_Buyer_BPID,
+                cd.dp_info_Seller_BPID
+            ORDER BY 
+                cd.dp_info_Contract_Start_Date DESC,
+                cd.dp_info_Version_Number DESC
+        ) AS dp_info_rn
+    FROM Product_Details pd
+    LEFT JOIN Contract_Details cd
+        ON pd.dp_info_Product_Series_Code = cd.dp_info_Product_Series_Code
+    LEFT JOIN Publisher_Details pub
+        ON cd.dp_info_Seller_BPID = pub.dp_info_BPID
+    LEFT JOIN Consumer_Details cons
+        ON cd.dp_info_Buyer_BPID = cons.dp_info_BPID
+    LEFT JOIN API_Call_Summary api
+        ON cd.dp_info_Contract_Series_Code = api.dp_info_Contract_Code
+)
+
+-- Step 7: Produce the final output by filtering deduplicated data and selecting required columns
+SELECT
+    dp_info_Product_Series_Code,
+    dp_info_Data_Product_Name,
+    dp_info_License_Type,
+    dp_info_Published_Date AS dp_info_Product_Published_Date,
+    dp_info_State,
+    dp_info_Contract_Series_Code,
+    dp_info_Total_API_Calls,
+    dp_info_Consumer_Organization_Name,
+    dp_info_Consumer_Registration_Date,
+    dp_info_Publisher_Organization_Name,
+    dp_info_Publisher_Registration_Date,
+    dp_info_Contract_Start_Date,
+    dp_info_Contract_End_Date
+FROM Combined_Data
+WHERE dp_info_rn = 1 OR dp_info_rn IS NULL
+ORDER BY 
+    dp_info_Product_Series_Code,
+    dp_info_Consumer_Organization_Name;
