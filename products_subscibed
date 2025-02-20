@@ -1,41 +1,61 @@
--- Extracts active contracts where the contract is currently valid
+-- Step 1: Extract active contracts where the contract is currently valid
 WITH active_contracts AS (
     SELECT 
-        SAFE_CAST(`Buyer BPID` AS STRING) AS Consumer_BPID,  -- Convert BPID to STRING for proper joins
-        `Data Product Code` AS Data_Product_Code,  -- Standardize column name for consistency
-        `Contract Start Date` AS Contract_Start_Date,  -- Alias for readability
-        `Contract Expiry Date` AS Contract_Expiry_Date  -- Alias for readability
+        SAFE_CAST(`Buyer BPID` AS STRING) AS Consumer_BPID,  -- Convert BPID to STRING for joins
+        `Product Series Code` AS Product_Series_Code,  -- Use series code to avoid duplication
+        `Data Product Name` AS Data_Product_Name,  -- Retain product name for filtering
+        `Contract Start Date` AS Contract_Start_Date,  
+        `Contract Expiry Date` AS Contract_Expiry_Date  
     FROM `rdmga4.RDMreports.contracts`
-    WHERE CURRENT_DATE BETWEEN `Contract Start Date` AND `Contract Expiry Date`  -- Only active contracts
+    WHERE CURRENT_DATE BETWEEN `Contract Start Date` AND `Contract Expiry Date`
 ),
 
--- Extracts consumer organization details from the raw organization overview table
+-- Step 2: Extract consumer organization details
 consumer_info AS (
     SELECT 
-        SAFE_CAST(BPID AS STRING) AS consumer_id,  -- Convert BPID to STRING to match contracts
-        `Organization Name` AS consumer_name  -- Standardized alias for clarity
+        SAFE_CAST(BPID AS STRING) AS consumer_id,  
+        `Organization Name` AS consumer_name  
     FROM `rdmga4.RDMreports.raw_organization_overview`
 ),
 
--- Extracts product details for reference
+-- Step 3: Extract product details while ensuring we only use the `Product Series Code`
 product_info AS (
     SELECT 
-        `Data Product Code` AS Data_Product_Code,  -- Standardized alias for consistency
-        `Data Product Name` AS Data_Product_Name  -- Standardized alias for consistency
+        `Product Series Code` AS Product_Series_Code,  
+        `Data Product Name` AS Data_Product_Name  
     FROM `rdmga4.RDMreports.raw_data_product_details`
+    GROUP BY `Product Series Code`, `Data Product Name`
+),
+
+-- Step 4: Deduplicate data by keeping only one Product Series Code per Data Product Name per Consumer
+deduplicated_data AS (
+    SELECT 
+        ac.Consumer_BPID,
+        ac.Data_Product_Name,
+        ac.Product_Series_Code,
+        ac.Contract_Start_Date,
+        ac.Contract_Expiry_Date,
+        ROW_NUMBER() OVER (
+            PARTITION BY ac.Consumer_BPID, ac.Data_Product_Name 
+            ORDER BY ac.Contract_Start_Date DESC  -- Prioritize the most recent contract
+        ) AS row_num
+    FROM active_contracts ac
 )
 
--- Final selection: Combines active contracts, consumer details, and product details
+-- Step 5: Final selection, ensuring only one product series per consumer and product name
 SELECT 
-    ci.consumer_id AS pds_consumer_id,  -- Unique identifier for consumer
-    ci.consumer_name AS pds_consumer_name,  -- Name of the consumer organization
-    ac.Data_Product_Code AS pds_data_product_code,  -- Unique product identifier
-    pi.Data_Product_Name AS pds_data_product_name,  -- Name of the subscribed data product
-    ac.Contract_Start_Date AS pds_contract_start_date,  -- Contract start date
-    ac.Contract_Expiry_Date AS pds_contract_expiry_date  -- Contract expiry date
-FROM active_contracts ac
+    ci.consumer_id AS pds_consumer_id,  
+    ci.consumer_name AS pds_consumer_name,  
+    dd.Product_Series_Code AS pds_product_series_code,  
+    dd.Data_Product_Name AS pds_data_product_name,  
+    dd.Contract_Start_Date AS pds_contract_start_date,  
+    dd.Contract_Expiry_Date AS pds_contract_expiry_date  
+FROM deduplicated_data dd
 JOIN consumer_info ci 
-    ON ac.Consumer_BPID = ci.consumer_id  -- Match contracts with consumer details via BPID
+    ON dd.Consumer_BPID = ci.consumer_id  
 JOIN product_info pi
-    ON ac.Data_Product_Code = pi.Data_Product_Code;  -- Match contracts with product details
+    ON dd.Product_Series_Code = pi.Product_Series_Code  
+    AND dd.Data_Product_Name = pi.Data_Product_Name  -- Ensuring we map correctly
+WHERE dd.row_num = 1;  -- Only keep one product series per consumer-product combination
+
 
