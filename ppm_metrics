@@ -410,3 +410,171 @@ FROM
 ORDER BY 
     ppm_month, ppm_publisher, ppm_product, ppm_consumer;
 
+
+
+
+------------------ Appears to be more improved
+WITH monthly_dates AS (
+    SELECT 
+        CAST(FORMAT_DATE('%Y-%m-01', DATE(month_date)) AS DATE) AS month_date
+    FROM 
+        UNNEST(GENERATE_DATE_ARRAY('2023-01-01', CURRENT_DATE(), INTERVAL 1 MONTH)) AS month_date
+),
+DeduplicatedContracts AS (
+    SELECT
+        CAST(`Contract Code` AS STRING) AS Contract_Code,
+        CAST(`Buyer BPID` AS STRING) AS Buyer_BPID,
+        CAST(`Seller BPID` AS STRING) AS Seller_BPID,
+        DATE(`Contract Start Date`)      AS Contract_Start_Date,
+        DATE(`Contract Expiry Date`)     AS Contract_End_Date,
+        `Data Product Code`,
+        `Contract Series Code`,
+        ROW_NUMBER() OVER (
+            PARTITION BY CAST(`Buyer BPID` AS STRING), `Contract Series Code`
+            ORDER BY `Contract Start Date` ASC
+        ) AS RowNum
+    FROM 
+        `rdmga4.RDMreports.contracts`
+    WHERE 
+        `Contract Start Date` IS NOT NULL
+        AND `Contract Expiry Date` IS NOT NULL
+        AND `Buyer BPID` IS NOT NULL
+),
+ActivePeriods AS (
+    SELECT
+        dc.Contract_Code,
+        dc.Buyer_BPID,
+        dc.Seller_BPID,
+        dc.`Data Product Code`,
+        DATE_TRUNC(dc.Contract_Start_Date, MONTH) AS start_month,
+        DATE_TRUNC(DATE_ADD(dc.Contract_End_Date, INTERVAL 1 MONTH), MONTH) AS end_month
+    FROM DeduplicatedContracts dc
+    WHERE dc.RowNum = 1
+),
+ActiveConnections AS (
+    SELECT DISTINCT
+        md.month_date AS active_month,
+        ap.Contract_Code,
+        ap.Buyer_BPID,
+        ap.Seller_BPID,
+        ap.`Data Product Code`
+    FROM 
+        monthly_dates md
+    JOIN ActivePeriods ap
+        ON md.month_date >= ap.start_month
+        AND md.month_date < ap.end_month
+),
+/* ---- If you don't need ActiveCounts anymore, you can drop it ----
+ActiveCounts AS (
+    SELECT
+        md.month_date,
+        COALESCE(
+            SUM(COALESCE(nc.new_connections, 0))
+            OVER (ORDER BY md.month_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 0
+        ) - COALESCE(
+            SUM(COALESCE(ec.expired_connections, 0))
+            OVER (ORDER BY md.month_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 0
+        ) AS net_active_connections
+    FROM monthly_dates md
+    LEFT JOIN (
+        SELECT
+            DATE_TRUNC(Contract_Start_Date, MONTH) AS start_month,
+            COUNT(DISTINCT CONCAT(Buyer_BPID, '-', `Contract Series Code`)) AS new_connections
+        FROM DeduplicatedContracts
+        WHERE RowNum = 1
+        GROUP BY DATE_TRUNC(Contract_Start_Date, MONTH)
+    ) nc 
+        ON md.month_date = nc.start_month
+    LEFT JOIN (
+        SELECT
+            DATE_TRUNC(DATE_ADD(Contract_End_Date, INTERVAL 1 MONTH), MONTH) AS end_month,
+            COUNT(DISTINCT CONCAT(Buyer_BPID, '-', `Contract Series Code`)) AS expired_connections
+        FROM DeduplicatedContracts
+        WHERE RowNum = 1
+        GROUP BY DATE_TRUNC(DATE_ADD(Contract_End_Date, INTERVAL 1 MONTH), MONTH)
+    ) ec
+        ON md.month_date = ec.end_month
+),
+--------------------------------------------------------------- */
+ContractActivity AS (
+    SELECT 
+        ac.Contract_Code,
+        ac.Buyer_BPID,
+        CASE 
+            WHEN MAX(COALESCE(dc.`Total number of Hits`, 0)) = 0 
+                 AND MAX(COALESCE(dc.`Total Volume Consumed in Bytes`, 0)) = 0 
+            THEN TRUE 
+            ELSE FALSE 
+        END AS is_inactive
+    FROM 
+        ActiveConnections ac
+    LEFT JOIN 
+        `rdmga4.RDMreports.daily_consumption` dc
+        ON CAST(ac.Contract_Code AS STRING) = CAST(dc.`Contract Code` AS STRING)
+    GROUP BY 
+        ac.Contract_Code,
+        ac.Buyer_BPID
+)
+SELECT 
+    ROW_NUMBER() OVER() AS ppm_id,
+    ro_seller.`Organization Name` AS ppm_publisher,
+    ro_buyer.`Organization Name`  AS ppm_consumer,
+    dpd.`Data Product Name`       AS ppm_product,
+    md.month_date                 AS ppm_month,
+
+    -- Count how many distinct buyer connections had no hits
+    COUNT(DISTINCT CASE 
+        WHEN ca.is_inactive = TRUE THEN ac.Buyer_BPID
+    END) AS ppm_users_no_api_calls_all_time,
+
+    -- Count how many distinct buyer connections had hits
+    COUNT(DISTINCT CASE 
+        WHEN ca.is_inactive = FALSE THEN ac.Buyer_BPID
+    END) AS ppm_users_with_api_calls_all_time,
+
+    SUM(COALESCE(dc.`Total number of Hits`, 0))                 AS ppm_total_hits,
+    SUM(COALESCE(dc.`Total Volume Consumed in Bytes`, 0))       AS ppm_total_volume,
+
+    -- Replace net_active_connections with a distinct-count of the
+    -- same IDs used by your New/Expired logic:
+    COUNT(DISTINCT CASE 
+        WHEN ac.Contract_Code IS NOT NULL THEN 
+             CONCAT(ac.Buyer_BPID, '-', ddc.`Contract Series Code`) 
+    END) AS ppm_total_consumers
+
+FROM 
+    monthly_dates             AS md
+-- Left-join your active connections
+LEFT JOIN ActiveConnections  AS ac
+       ON md.month_date   = ac.active_month
+-- Left-join to check activity
+LEFT JOIN ContractActivity   AS ca
+       ON ac.Contract_Code  = ca.Contract_Code
+-- Consumption data
+LEFT JOIN `rdmga4.RDMreports.daily_consumption` AS dc
+       ON CAST(ac.Contract_Code AS STRING) = CAST(dc.`Contract Code` AS STRING)
+      AND DATE_TRUNC(dc.`Metrics Collection Date`, MONTH) = md.month_date
+-- Join buyer / seller org info
+LEFT JOIN `rdmga4.RDMreports.raw_organization_overview` AS ro_buyer
+       ON ac.Buyer_BPID = CAST(ro_buyer.`BPID` AS STRING)
+LEFT JOIN `rdmga4.RDMreports.raw_organization_overview` AS ro_seller
+       ON ac.Seller_BPID = CAST(ro_seller.`BPID` AS STRING)
+-- Data product details
+LEFT JOIN `rdmga4.RDMreports.raw_data_product_details` AS dpd
+       ON ac.`Data Product Code` = dpd.`Data Product Code`
+-- Needed to retrieve the same Contract Series Code that was used in new/expired:
+LEFT JOIN DeduplicatedContracts ddc
+       ON ac.Contract_Code = ddc.Contract_Code
+      AND ddc.RowNum = 1
+
+-- Keep only rows where the buyer org name is not null 
+WHERE 
+    ro_buyer.`Organization Name` IS NOT NULL
+
+GROUP BY 
+    ppm_publisher, ppm_consumer, ppm_product, ppm_month,
+    ro_seller.`Organization Name`, ro_buyer.`Organization Name`, 
+    dpd.`Data Product Name`
+ORDER BY 
+    ppm_month, ppm_publisher, ppm_product, ppm_consumer;
+
