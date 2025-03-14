@@ -1,0 +1,155 @@
+---- removed product data
+
+    WITH Product_Details AS (
+    SELECT 
+        `Product Series Code`,
+        COALESCE(`Data Product Name`, 'Unnamed Product') AS Data_Product_Name,
+        SAFE_CAST(`Published Date` AS DATE) AS Published_Date,
+        `Version Number`,
+        `State`
+    FROM 
+        `rdmga4.RDMreports.raw_data_product_details`
+    WHERE 
+        `State` IN ('active', 'expired') -- Include both active and expired products
+),
+
+Contract_Details AS (
+    SELECT 
+        `Product Series Code`,
+        SAFE_CAST(`Sunsetting Date` AS DATE) AS Sunsetting_Date,
+        CAST(`Seller BPID` AS STRING) AS Seller_BPID -- Cast Seller BPID to STRING
+    FROM 
+        `rdmga4.RDMreports.contracts`
+),
+
+Organization_Details AS (
+    SELECT 
+        CAST(`BPID` AS STRING) AS Publisher_BPID, -- Cast BPID to STRING
+        `Organization Name` AS Publisher_Organization_Name
+    FROM 
+        `rdmga4.RDMreports.raw_organization_overview`
+),
+
+Combined_Product_Data AS (
+    SELECT 
+        pd.`Product Series Code`,
+        pd.Data_Product_Name,
+        pd.Published_Date,
+        pd.`Version Number`,
+        cd.Sunsetting_Date,
+        org.Publisher_Organization_Name,
+        pd.State
+    FROM 
+        Product_Details pd
+    INNER JOIN 
+        Contract_Details cd
+    ON 
+        pd.`Product Series Code` = cd.`Product Series Code`
+    LEFT JOIN 
+        Organization_Details org
+    ON 
+        cd.Seller_BPID = org.Publisher_BPID -- Match using consistent data type (STRING)
+),
+
+Active_Periods AS (
+    SELECT 
+        `Product Series Code`,
+        Data_Product_Name,
+        Publisher_Organization_Name,
+        COALESCE(Published_Date, DATE('2023-01-01')) AS Start_Date,
+        CASE 
+            WHEN State = 'expired' THEN Sunsetting_Date
+            ELSE DATE_TRUNC(CURRENT_DATE(), MONTH) -- Dynamically extend to the current month
+        END AS End_Date
+    FROM 
+        Combined_Product_Data
+    WHERE 
+        Sunsetting_Date IS NULL OR Sunsetting_Date >= DATE('2023-01-01')
+),
+
+Expanded_Active_Periods AS (
+    SELECT 
+        `Product Series Code`,
+        Data_Product_Name,
+        Publisher_Organization_Name,
+        ACTIVE_MONTH AS Active_Month
+    FROM 
+        Active_Periods,
+        UNNEST(
+            GENERATE_DATE_ARRAY(
+                DATE_TRUNC(Start_Date, MONTH),
+                LEAST(DATE_TRUNC(End_Date, MONTH), DATE_TRUNC(CURRENT_DATE(), MONTH)), -- Restrict to current month
+                INTERVAL 1 MONTH
+            )
+        ) AS ACTIVE_MONTH
+),
+
+First_Active_Month AS (
+    SELECT 
+        `Product Series Code`,
+        Data_Product_Name,
+        Publisher_Organization_Name,
+        DATE_TRUNC(MIN(Start_Date), MONTH) AS First_Active_Month
+    FROM 
+        Active_Periods
+    GROUP BY 
+        `Product Series Code`, Data_Product_Name, Publisher_Organization_Name
+),
+
+Removed_Products AS (
+    SELECT 
+        `Product Series Code`,
+        Data_Product_Name,
+        Publisher_Organization_Name,
+        Sunsetting_Date AS Removed_Date
+    FROM 
+        Combined_Product_Data
+    WHERE 
+        State = 'expired' AND Sunsetting_Date IS NOT NULL
+),
+
+Monthly_Products AS (
+    SELECT 
+        eap.Active_Month,
+        eap.Publisher_Organization_Name,
+        COUNT(DISTINCT eap.`Product Series Code`) AS Products_Active_Count,
+        ARRAY_AGG(DISTINCT eap.Data_Product_Name) AS Active_Product_Names,
+        COUNT(DISTINCT CASE WHEN eap.Active_Month = fam.First_Active_Month THEN eap.`Product Series Code` END) AS Products_Added_Count,
+        ARRAY_AGG(DISTINCT CASE 
+            WHEN eap.Active_Month = fam.First_Active_Month THEN eap.Data_Product_Name 
+            ELSE NULL 
+        END IGNORE NULLS) AS Added_Product_Names,
+        COUNT(DISTINCT CASE WHEN rp.Removed_Date IS NOT NULL AND DATE_TRUNC(rp.Removed_Date, MONTH) = eap.Active_Month THEN rp.`Product Series Code` END) AS Products_Removed_Count,
+        ARRAY_AGG(DISTINCT CASE 
+            WHEN rp.Removed_Date IS NOT NULL AND DATE_TRUNC(rp.Removed_Date, MONTH) = eap.Active_Month THEN rp.Data_Product_Name
+            ELSE NULL 
+        END IGNORE NULLS) AS Removed_Product_Names
+    FROM 
+        Expanded_Active_Periods eap
+    LEFT JOIN 
+        First_Active_Month fam
+    ON 
+        eap.`Product Series Code` = fam.`Product Series Code`
+        AND eap.Publisher_Organization_Name = fam.Publisher_Organization_Name
+    LEFT JOIN 
+        Removed_Products rp
+    ON 
+        eap.`Product Series Code` = rp.`Product Series Code`
+        AND eap.Publisher_Organization_Name = rp.Publisher_Organization_Name
+    GROUP BY 
+        eap.Active_Month, eap.Publisher_Organization_Name
+    ORDER BY 
+        eap.Active_Month, eap.Publisher_Organization_Name
+)
+
+SELECT 
+    DATE_TRUNC(Active_Month, MONTH) AS Month, -- Ensure Month is a true DATE type
+    Publisher_Organization_Name,
+    Products_Active_Count,
+    Active_Product_Names,
+    Products_Added_Count,
+    Added_Product_Names,
+    Products_Removed_Count,
+    Removed_Product_Names
+FROM 
+    Monthly_Products;
