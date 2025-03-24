@@ -696,3 +696,155 @@ ORDER BY
   dac_Date, -- Order by date
   CASE WHEN dac_org_category_name = 'Total' THEN 1 ELSE 0 END, -- Push "Total" rows to the bottom
   dac_org_category_name; -- Further order by category name
+
+
+
+---------------------------- Fully working 
+
+WITH Months AS (
+  SELECT 
+    DATE_TRUNC(DATE_ADD(DATE('2023-01-01'), INTERVAL n MONTH), MONTH) AS Month_Start
+  FROM 
+    UNNEST(GENERATE_ARRAY(0, DATE_DIFF(CURRENT_DATE(), DATE('2023-01-01'), MONTH))) AS n
+),
+
+ProductPublishedDates AS (
+  SELECT
+    `Data Product Code`,
+    `Product Series Code`,
+    MIN(DATE(`Published Date`)) AS Published_Date
+  FROM 
+    `rdmga4.RDMreports.raw_data_product_details`
+  WHERE 
+    `Published Date` IS NOT NULL
+  GROUP BY 
+    `Data Product Code`, `Product Series Code`
+),
+
+DeduplicatedContracts AS (
+  SELECT
+    c.`Buyer BPID`,
+    c.`Data Product Code`,
+    c.`Product Series Code`,
+    c.`Contract Start Date`,
+    c.`Contract Expiry Date`,
+    GREATEST(c.`Contract Start Date`, COALESCE(p.Published_Date, c.`Contract Start Date`)) AS Effective_Start_Date,
+    ro.`Organization category` AS Org_Category,
+    ROW_NUMBER() OVER (
+      PARTITION BY c.`Buyer BPID`, c.`Product Series Code`
+      ORDER BY c.`Contract Start Date` ASC
+    ) AS RowNum
+  FROM
+    rdmga4.RDMreports.contracts c
+  LEFT JOIN ProductPublishedDates p 
+    ON c.`Product Series Code` = p.`Product Series Code`
+    AND c.`Data Product Code` = p.`Data Product Code`
+  LEFT JOIN rdmga4.RDMreports.raw_organization_overview ro
+    ON CAST(c.`Buyer BPID` AS STRING) = CAST(ro.`BPID` AS STRING)
+  WHERE
+    c.`Contract Start Date` IS NOT NULL
+    AND c.`Contract Expiry Date` IS NOT NULL
+    AND ro.`Organization category` IS NOT NULL
+),
+
+ActiveConnections AS (
+  SELECT
+    DATE_TRUNC(Effective_Start_Date, MONTH) AS Active_Month,
+    Org_Category,
+    COUNT(DISTINCT CONCAT(`Buyer BPID`, '-', `Product Series Code`)) AS Active_Count
+  FROM
+    DeduplicatedContracts
+  WHERE
+    RowNum = 1
+  GROUP BY
+    Active_Month, Org_Category
+),
+
+ExpiredConnections AS (
+  SELECT
+    DATE_TRUNC(DATE_ADD(`Contract Expiry Date`, INTERVAL 1 MONTH), MONTH) AS Expired_Month,
+    Org_Category,
+    COUNT(DISTINCT CONCAT(`Buyer BPID`, '-', `Product Series Code`)) AS Expired_Count
+  FROM
+    DeduplicatedContracts
+  WHERE
+    RowNum = 1
+  GROUP BY
+    Expired_Month, Org_Category
+),
+
+AllMonthCategories AS (
+  SELECT
+    m.Month_Start AS Date,
+    c.Org_Category
+  FROM
+    Months m
+  CROSS JOIN (
+    SELECT DISTINCT Org_Category FROM DeduplicatedContracts
+  ) c
+),
+
+MonthlySummary AS (
+  SELECT
+    amc.Date,
+    amc.Org_Category,
+    COALESCE(a.Active_Count, 0) AS Active,
+    COALESCE(e.Expired_Count, 0) AS Expired
+  FROM
+    AllMonthCategories amc
+  LEFT JOIN ActiveConnections a 
+    ON amc.Date = a.Active_Month AND amc.Org_Category = a.Org_Category
+  LEFT JOIN ExpiredConnections e 
+    ON amc.Date = e.Expired_Month AND amc.Org_Category = e.Org_Category
+),
+
+CumulativeSummary AS (
+  SELECT
+    Date,
+    Org_Category,
+    SUM(Active) OVER (PARTITION BY Org_Category ORDER BY Date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) -
+    SUM(Expired) OVER (PARTITION BY Org_Category ORDER BY Date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS Total_Active_Data_Connections,
+    Active,
+    Expired
+  FROM
+    MonthlySummary
+),
+
+FinalSummary AS (
+  SELECT
+    Date,
+    Org_Category,
+    Active,
+    Expired,
+    Total_Active_Data_Connections
+  FROM
+    CumulativeSummary
+
+  UNION ALL
+
+  SELECT
+    Date,
+    'Total' AS Org_Category,
+    SUM(Active),
+    SUM(Expired),
+    SUM(Total_Active_Data_Connections)
+  FROM
+    CumulativeSummary
+  GROUP BY Date
+)
+
+-- Final output
+SELECT
+  FORMAT_DATE('%b-%Y', Date) AS Month,
+  Org_Category,
+  Active,
+  Expired,
+  Total_Active_Data_Connections
+FROM
+  FinalSummary
+WHERE
+  Date BETWEEN DATE('2023-01-01') AND CURRENT_DATE()
+ORDER BY
+  Date,
+  CASE WHEN Org_Category = 'Total' THEN 1 ELSE 0 END,
+  Org_Category;
