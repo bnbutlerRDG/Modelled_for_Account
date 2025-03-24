@@ -1,0 +1,98 @@
+WITH monthly_dates AS (
+    SELECT 
+        CAST(FORMAT_DATE('%Y-%m-01', d) AS DATE) AS month_date
+    FROM UNNEST(
+        GENERATE_DATE_ARRAY('2023-01-01', CURRENT_DATE(), INTERVAL 1 MONTH)
+    ) AS d
+),
+DeduplicatedContracts AS (
+    SELECT
+        CAST(`Contract Code` AS STRING)      AS Contract_Code,
+        CAST(`Buyer BPID` AS STRING)         AS Buyer_BPID,
+        CAST(`Seller BPID` AS STRING)        AS Seller_BPID,
+        DATE(`Contract Start Date`)          AS Contract_Start_Date,
+        DATE(`Contract Expiry Date`)         AS Contract_Expiry_Date,
+        `Data Product Code`                 AS Data_Product_Code,
+        `Contract Series Code`               AS Contract_Series_Code,
+        ROW_NUMBER() OVER (
+            PARTITION BY CAST(`Buyer BPID` AS STRING), `Contract Series Code`
+            ORDER BY `Contract Start Date` ASC
+        ) AS row_num
+    FROM rdmga4.RDMreports.contracts
+    WHERE 
+          `Contract Start Date`   IS NOT NULL
+      AND `Contract Expiry Date`  IS NOT NULL
+      AND `Buyer BPID`           IS NOT NULL
+),
+ActivePeriods AS (
+    SELECT
+        Contract_Code,
+        Buyer_BPID,
+        Seller_BPID,
+        Data_Product_Code,
+        DATE_TRUNC(Contract_Start_Date, MONTH) AS start_month,
+        DATE_TRUNC(
+          DATE_ADD(Contract_Expiry_Date, INTERVAL 1 MONTH),
+          MONTH
+        ) AS end_month
+    FROM DeduplicatedContracts
+    WHERE row_num = 1
+),
+ActiveConnections AS (
+    SELECT
+        md.month_date AS active_month,
+        ap.Contract_Code,
+        ap.Buyer_BPID,
+        ap.Seller_BPID,
+        ap.Data_Product_Code
+    FROM monthly_dates md
+    JOIN ActivePeriods ap
+      ON  md.month_date >= ap.start_month
+      AND md.month_date <  ap.end_month
+),
+BuyerOrg AS (
+    SELECT
+        CAST(BPID AS STRING) AS bpid,
+        `Organization Name`   AS org_name
+    FROM rdmga4.RDMreports.raw_organization_overview
+),
+-- New CTE for Publishers (Sellers)
+PublisherOrg AS (
+    SELECT
+        CAST(BPID AS STRING) AS bpid,
+        `Organization Name`   AS org_name
+    FROM rdmga4.RDMreports.raw_organization_overview
+),
+ProductInfo AS (
+    SELECT
+        `Data Product Code`   AS data_product_code,
+        `Data Product Name`   AS data_product_name,
+        `Product Series Code` AS product_series_code
+    FROM rdmga4.RDMreports.raw_data_product_details
+    GROUP BY 1, 2, 3
+)
+SELECT
+    ac.active_month                              AS pds_active_month,
+    bo.bpid                                      AS pds_consumer_id,
+    bo.org_name                                  AS pds_consumer_name,
+    po.org_name                                  AS pds_publisher_name,  -- New column for publisher name
+    pi.product_series_code                       AS pds_product_series_code,
+    pi.data_product_name                         AS pds_data_product_name,
+    dc.Contract_Start_Date                       AS pds_contract_start_date,
+    dc.Contract_Expiry_Date                      AS pds_contract_expiry_date
+FROM ActiveConnections ac
+LEFT JOIN DeduplicatedContracts dc
+       ON ac.Contract_Code = dc.Contract_Code
+      AND dc.row_num = 1
+LEFT JOIN BuyerOrg bo
+       ON ac.Buyer_BPID = bo.bpid
+LEFT JOIN PublisherOrg po  -- Joining publishers
+       ON ac.Seller_BPID = po.bpid
+LEFT JOIN ProductInfo pi
+       ON ac.Data_Product_Code = pi.data_product_code
+WHERE bo.org_name IS NOT NULL
+  AND ac.active_month = DATE_TRUNC(CURRENT_DATE(), MONTH)  -- Only the current month
+ORDER BY 
+    pds_active_month, 
+    pds_consumer_name, 
+    pds_data_product_name;
