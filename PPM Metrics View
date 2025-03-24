@@ -1,0 +1,120 @@
+-- Create or replace the view to store PPM metrics
+CREATE OR REPLACE VIEW `rdmga4.RDMreports.ppm_metrics_view_2` AS
+SELECT * FROM (
+    -- Generate a list of month start dates from January 2023 to the current month
+    WITH monthly_dates AS (
+        SELECT CAST(FORMAT_DATE('%Y-%m-01', month_date) AS DATE) AS month_date
+        FROM UNNEST(GENERATE_DATE_ARRAY('2023-01-01', CURRENT_DATE(), INTERVAL 1 MONTH)) AS month_date
+    ),
+
+    -- Deduplicate contracts based on Buyer BPID and Product Series Code, keeping the earliest contract start date
+    DeduplicatedContracts AS (
+        SELECT
+            CAST(`Contract Code` AS STRING) AS Contract_Code,
+            CAST(`Buyer BPID` AS STRING) AS Buyer_BPID,
+            CAST(`Seller BPID` AS STRING) AS Seller_BPID,
+            DATE(`Contract Start Date`) AS Contract_Start_Date,
+            DATE(`Contract Expiry Date`) AS Contract_End_Date,
+            `Data Product Code`,
+            `Product Series Code`,
+            ROW_NUMBER() OVER (
+                PARTITION BY CAST(`Buyer BPID` AS STRING), `Product Series Code`
+                ORDER BY `Contract Start Date` ASC
+            ) AS RowNum
+        FROM `rdmga4.RDMreports.contracts`
+        WHERE `Contract Start Date` IS NOT NULL AND `Buyer BPID` IS NOT NULL
+    ),
+
+    -- Get the earliest published date for each data product
+    ProductPublishedDates AS (
+        SELECT
+            `Data Product Code`,
+            `Product Series Code`,
+            MIN(DATE(`Published Date`)) AS Published_Date
+        FROM `rdmga4.RDMreports.raw_data_product_details`
+        WHERE `Published Date` IS NOT NULL
+        GROUP BY `Data Product Code`, `Product Series Code`
+    ),
+
+    -- Aggregate daily consumption data at the monthly level
+    DeduplicatedDailyConsumption AS (
+        SELECT
+            CAST(`Contract Code` AS STRING) AS Contract_Code,
+            DATE_TRUNC(`Metrics Collection Date`, MONTH) AS month_date,
+            SUM(COALESCE(`Total number of Hits`, 0)) AS Total_Hits,
+            SUM(COALESCE(`Total Volume Consumed in Bytes`, 0)) AS Total_Volume
+        FROM `rdmga4.RDMreports.daily_consumption`
+        GROUP BY Contract_Code, DATE_TRUNC(`Metrics Collection Date`, MONTH)
+    ),
+
+    -- Generate a list of months for each contract, ensuring contracts are only included within valid date ranges
+    ContractMonths AS (
+        SELECT
+            md.month_date,
+            dc.Contract_Code,
+            dc.Buyer_BPID,
+            dc.Seller_BPID,
+            dc.`Data Product Code`,
+            dc.`Product Series Code`
+        FROM monthly_dates md
+        CROSS JOIN DeduplicatedContracts dc
+        LEFT JOIN ProductPublishedDates ppd
+            ON dc.`Data Product Code` = ppd.`Data Product Code`
+            AND dc.`Product Series Code` = ppd.`Product Series Code`
+        WHERE dc.RowNum = 1
+          AND md.month_date >= GREATEST(
+              DATE_TRUNC(dc.Contract_Start_Date, MONTH),
+              COALESCE(DATE_TRUNC(ppd.Published_Date, MONTH), DATE_TRUNC(dc.Contract_Start_Date, MONTH))
+          )
+          AND md.month_date <= COALESCE(DATE_TRUNC(dc.Contract_End_Date, MONTH), DATE_TRUNC(CURRENT_DATE(), MONTH))
+    ),
+
+    -- Combine contract activity with API usage metrics
+    MonthlyContractActivity AS (
+        SELECT
+            COALESCE(cm.month_date, ddc.month_date) AS month_date,
+            COALESCE(cm.Contract_Code, ddc.Contract_Code) AS Contract_Code,
+            COALESCE(cm.Buyer_BPID, dc.Buyer_BPID) AS Buyer_BPID,
+            COALESCE(cm.Seller_BPID, dc.Seller_BPID) AS Seller_BPID,
+            COALESCE(cm.`Data Product Code`, dc.`Data Product Code`) AS `Data Product Code`,
+            COALESCE(cm.`Product Series Code`, dc.`Product Series Code`) AS `Product Series Code`,
+            COALESCE(ddc.Total_Hits, 0) AS Total_Hits,
+            COALESCE(ddc.Total_Volume, 0) AS Total_Volume,
+            IF(ddc.Total_Hits > 0, 1, 0) AS has_api_hits,
+            IF(cm.Contract_Code IS NOT NULL, 1, 0) AS is_active
+        FROM ContractMonths cm
+        FULL OUTER JOIN DeduplicatedDailyConsumption ddc
+            ON cm.Contract_Code = ddc.Contract_Code
+           AND cm.month_date = ddc.month_date
+        LEFT JOIN DeduplicatedContracts dc
+            ON ddc.Contract_Code = dc.Contract_Code
+    )
+
+    -- Final selection and aggregations for PPM metrics
+    SELECT
+        ROW_NUMBER() OVER() AS ppm_id,
+        ro_seller.`Organization Name` AS ppm_publisher,
+        ro_buyer.`Organization Name` AS ppm_consumer,
+        dpd.`Data Product Name` AS ppm_product,
+        mca.month_date AS ppm_month,
+        -- Count users with active contracts but no API calls
+        COUNT(DISTINCT IF(mca.has_api_hits = 0 AND mca.is_active = 1, CONCAT(mca.Buyer_BPID, '-', mca.Contract_Code), NULL)) AS ppm_users_no_api_calls_all_time,
+        -- Count users with API calls
+        COUNT(DISTINCT IF(mca.has_api_hits = 1, CONCAT(mca.Buyer_BPID, '-', mca.Contract_Code), NULL)) AS ppm_users_with_api_calls_all_time,
+        -- Sum total API hits
+        SUM(mca.Total_Hits) AS ppm_total_hits,
+        -- Sum total data volume consumed
+        SUM(mca.Total_Volume) AS ppm_total_volume,
+        -- Count total active consumers
+        COUNT(DISTINCT IF(mca.is_active = 1, CONCAT(mca.Buyer_BPID, '-', mca.Contract_Code), NULL)) AS ppm_total_consumers
+    FROM MonthlyContractActivity mca
+    LEFT JOIN `rdmga4.RDMreports.raw_organization_overview` ro_buyer
+        ON mca.Buyer_BPID = CAST(ro_buyer.`BPID` AS STRING)
+    LEFT JOIN `rdmga4.RDMreports.raw_organization_overview` ro_seller
+        ON mca.Seller_BPID = CAST(ro_seller.`BPID` AS STRING)
+    LEFT JOIN `rdmga4.RDMreports.raw_data_product_details` dpd
+        ON mca.`Data Product Code` = dpd.`Data Product Code`
+    WHERE ro_buyer.`Organization Name` IS NOT NULL
+    GROUP BY ppm_month, ppm_publisher, ppm_consumer, ppm_product
+    ORDER BY ppm_month, ppm_publisher, ppm_product, ppm_consumer
+);
