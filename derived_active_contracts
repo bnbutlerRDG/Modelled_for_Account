@@ -853,7 +853,7 @@ ORDER BY
 
 ------------------------------ view
 
-CREATE OR REPLACE VIEW `rdmga4.RDMreports.derived_active_contracts_view` AS
+CREATE OR REPLACE VIEW `rdmga4.RDMreports.derived_active_contracts` AS
 
 WITH Months AS (
   SELECT 
@@ -989,7 +989,7 @@ FinalSummary AS (
 
 -- Final output
 SELECT
-  FORMAT_DATE('%b-%Y', Date) AS Month,
+  Date AS Month, -- now in DATE format (e.g., 2023-01-01)
   Org_Category,
   Active,
   Expired,
@@ -1002,3 +1002,4 @@ ORDER BY
   Date,
   CASE WHEN Org_Category = 'Total' THEN 1 ELSE 0 END,
   Org_Category;
+
